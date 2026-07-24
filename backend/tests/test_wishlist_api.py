@@ -11,6 +11,9 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api import auth
 from app.services import platform_auth
+from app.services.wishlist_reconciliation import (
+    remove_stale_synced_wishlist_items,
+)
 from app.api.wishlist import (
     WishlistCreate,
     WishlistTransfer,
@@ -93,6 +96,48 @@ class WishlistApiTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["title"], "同一本書")
         self.assertEqual(len(result[0]["platforms"]), 2)
+
+    def test_remote_import_removes_only_stale_synced_platform_items(self):
+        with Session(self.engine) as session:
+            session.add_all([
+                Book(isbn="gone", title="已從遠端刪除", category="未分類"),
+                Book(isbn="keep", title="仍在遠端", category="未分類"),
+                Book(isbn="pending", title="等待同步", category="未分類"),
+            ])
+            session.add_all([
+                WishlistItem(
+                    user_id="reader", isbn="gone", platform="kobo",
+                    sync_status="synced",
+                ),
+                WishlistItem(
+                    user_id="reader", isbn="keep", platform="kobo",
+                    sync_status="synced",
+                ),
+                WishlistItem(
+                    user_id="reader", isbn="pending", platform="kobo",
+                    sync_status="pending",
+                ),
+                WishlistItem(
+                    user_id="reader", isbn="gone", platform="readmoo",
+                    sync_status="synced",
+                ),
+            ])
+            session.commit()
+
+            removed = remove_stale_synced_wishlist_items(
+                session,
+                "reader",
+                "kobo",
+                [{"isbn": "keep", "title": "仍在遠端"}],
+            )
+            session.commit()
+            items = session.exec(select(WishlistItem)).all()
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            {(item.isbn, item.platform) for item in items},
+            {("keep", "kobo"), ("pending", "kobo"), ("gone", "readmoo")},
+        )
 
     def test_add_by_title_refines_missing_fields_with_resolved_isbn(self):
         first_match = {

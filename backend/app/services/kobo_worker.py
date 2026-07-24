@@ -8,6 +8,9 @@ from sqlmodel import Session, select
 from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
 from app.services.platform_auth import set_platform_session_status
+from app.services.wishlist_reconciliation import (
+    remove_stale_synced_wishlist_items,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -331,13 +334,23 @@ async def import_kobo_wishlist_to_db(user_id: str) -> dict:
                             wish_item.sync_status = "synced"
                             db.add(wish_item)
 
+                removed_count = remove_stale_synced_wishlist_items(
+                    db,
+                    user_id,
+                    "kobo",
+                    remote_books,
+                )
                 db.commit()
             set_platform_session_status(user_id, "kobo", "active")
-            print(f"[Kobo Import] 資料庫同步完成！")
+            print(
+                "[Kobo Import] 資料庫同步完成！"
+                f" 已移除 {removed_count} 筆遠端不存在的同步項目"
+            )
             return {
                 "platform": "kobo",
                 "status": "success",
                 "books": len(remote_books),
+                "removed": removed_count,
                 "message": f"Kobo 待購清單同步完成（{len(remote_books)} 本）",
             }
 

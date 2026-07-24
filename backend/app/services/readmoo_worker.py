@@ -10,6 +10,9 @@ from app.services.platform_auth import (
     get_platform_auth_cookies,
     set_platform_session_status,
 )
+from app.services.wishlist_reconciliation import (
+    remove_stale_synced_wishlist_items,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -372,13 +375,23 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
                             wish_item.sync_status = "synced"
                             db.add(wish_item)
 
+                removed_count = remove_stale_synced_wishlist_items(
+                    db,
+                    user_id,
+                    "readmoo",
+                    remote_books,
+                )
                 db.commit()
             set_platform_session_status(user_id, "readmoo", "active")
-            print(f"[Readmoo Import] 資料庫同步完成！")
+            print(
+                "[Readmoo Import] 資料庫同步完成！"
+                f" 已移除 {removed_count} 筆遠端不存在的同步項目"
+            )
             return {
                 "platform": "readmoo",
                 "status": "success",
                 "books": len(remote_books),
+                "removed": removed_count,
                 "message": f"Readmoo 待購清單同步完成（{len(remote_books)} 本）",
             }
 
