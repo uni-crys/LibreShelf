@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 from sqlmodel import Session, select
 
 from app.database import engine
@@ -19,6 +19,10 @@ _SAFE_USER_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class PlatformLoginTimeout(Exception):
+    pass
+
+
+class PlatformLoginBlocked(Exception):
     pass
 
 
@@ -132,8 +136,86 @@ def set_platform_session_status(
 
 
 async def _is_logged_in(page, platform: str) -> bool:
-    cookies = await page.context.cookies()
-    return bool(get_platform_auth_cookies(cookies, platform))
+    try:
+        cookies = await page.context.cookies()
+        auth_cookies = get_platform_auth_cookies(cookies, platform)
+
+        if platform == "readmoo":
+            strong_auth_cookie = any(
+                cookie.get("name") in {
+                    "oauth_token",
+                    "oauth_refresh_token",
+                }
+                or (
+                    str(cookie.get("name", "")).startswith(
+                        "CognitoIdentityServiceProvider."
+                    )
+                    and str(cookie.get("name", "")).endswith(
+                        (
+                            ".accessToken",
+                            ".idToken",
+                            ".refreshToken",
+                        )
+                    )
+                )
+                for cookie in auth_cookies
+            )
+            if not strong_auth_cookie:
+                return False
+
+        current_url = page.url.lower()
+        if any(
+            token in current_url
+            for token in ("signin", "login", "oauth2")
+        ):
+            return False
+
+        if platform == "kobo":
+            if "www.kobo.com/" not in current_url:
+                return False
+            return bool(await page.evaluate("""
+                async () => {
+                    try {
+                        const response = await fetch(
+                            "/tw/zh/account",
+                            {
+                                credentials: "include",
+                                redirect: "follow"
+                            }
+                        );
+                        return response.ok
+                            && !/(signin|login|authorize)/i.test(
+                                response.url
+                            );
+                    } catch {
+                        return false;
+                    }
+                }
+            """))
+
+        login_visible = await page.locator(
+            "a:has-text('登入'):visible, "
+            "button:has-text('登入'):visible"
+        ).count()
+        return bool(auth_cookies) and login_visible == 0
+    except PlaywrightError:
+        # OAuth redirects can destroy the execution context between polls.
+        return False
+
+
+async def _readmoo_login_is_blocked(page) -> bool:
+    try:
+        body_text = (await page.locator("body").inner_text()).casefold()
+    except PlaywrightError:
+        return False
+    return any(
+        marker in body_text
+        for marker in (
+            "max challenge attempts exceeded",
+            "challenge attempts exceeded",
+            "captcha challenge",
+        )
+    )
 
 
 async def login_and_save_platform_state(
@@ -158,6 +240,7 @@ async def login_and_save_platform_state(
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
+        status_recorded = False
 
         try:
             await page.goto(
@@ -169,6 +252,13 @@ async def login_and_save_platform_state(
 
             deadline = asyncio.get_running_loop().time() + LOGIN_TIMEOUT_SECONDS
             while asyncio.get_running_loop().time() < deadline:
+                if (
+                    platform == "readmoo"
+                    and await _readmoo_login_is_blocked(page)
+                ):
+                    raise PlatformLoginBlocked(
+                        "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
+                    )
                 if await _is_logged_in(page, platform):
                     state = await save_platform_storage_state(
                         context,
@@ -178,6 +268,7 @@ async def login_and_save_platform_state(
                     if not state.get("cookies"):
                         raise RuntimeError("登入完成，但沒有取得可儲存的 Cookie")
                     set_platform_session_status(user_id, platform, "active")
+                    status_recorded = True
                     platform_label = (
                         "Readmoo" if platform == "readmoo" else "Kobo"
                     )
@@ -189,14 +280,23 @@ async def login_and_save_platform_state(
                     }
                 await asyncio.sleep(1)
 
-            set_platform_session_status(user_id, platform, "expired")
             raise PlatformLoginTimeout(
                 "等待登入逾時，請重新操作並在三分鐘內完成登入"
             )
+        except PlatformLoginBlocked:
+            set_platform_session_status(user_id, platform, "blocked")
+            status_recorded = True
+            raise
         except PlatformLoginTimeout:
+            set_platform_session_status(user_id, platform, "expired")
+            status_recorded = True
             raise
         except Exception:
             set_platform_session_status(user_id, platform, "expired")
+            status_recorded = True
             raise
         finally:
+            # Also covers client disconnects/cancellation during login.
+            if not status_recorded:
+                set_platform_session_status(user_id, platform, "expired")
             await browser.close()

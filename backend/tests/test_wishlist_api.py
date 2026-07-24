@@ -16,6 +16,7 @@ from app.api.wishlist import (
     WishlistTransfer,
     add_to_wishlist,
     get_wishlist,
+    trigger_wishlist_import,
     transfer_to_library,
 )
 from app.models import Book, PlatformSession, Purchase, WishlistItem
@@ -239,7 +240,7 @@ class PlatformStatusTests(unittest.TestCase):
         self.assertEqual(status["status"], "missing")
         self.assertTrue(status["needs_update"])
 
-    def test_session_cookie_is_active_unless_database_marks_expired(self):
+    def test_session_cookie_requires_recent_active_verification(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_dir = (
                 Path(temporary_directory)
@@ -259,6 +260,16 @@ class PlatformStatusTests(unittest.TestCase):
                 active = auth._inspect_platform_state(
                     "reader",
                     "readmoo",
+                    PlatformSession(
+                        user_id="reader",
+                        platform="readmoo",
+                        status="active",
+                        updated_at=datetime.utcnow(),
+                    ),
+                )
+                unverified = auth._inspect_platform_state(
+                    "reader",
+                    "readmoo",
                     None,
                 )
                 expired = auth._inspect_platform_state(
@@ -274,8 +285,39 @@ class PlatformStatusTests(unittest.TestCase):
 
         self.assertEqual(active["status"], "active")
         self.assertFalse(active["needs_update"])
+        self.assertEqual(unverified["status"], "unverified")
+        self.assertTrue(unverified["needs_update"])
         self.assertEqual(expired["status"], "expired")
         self.assertTrue(expired["needs_update"])
+
+    def test_blocked_session_is_not_reported_as_active(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = (
+                Path(temporary_directory)
+                / "user_profiles"
+                / "reader"
+                / "readmoo"
+            )
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").write_text(
+                ('{"cookies":[{"name":"oauth_token","value":"ok",'
+                 '"domain":"read.readmoo.com","expires":-1}]}'),
+                encoding="utf-8",
+            )
+            with patch.object(auth, "BASE_DIR", Path(temporary_directory)):
+                status = auth._inspect_platform_state(
+                    "reader",
+                    "readmoo",
+                    PlatformSession(
+                        user_id="reader",
+                        platform="readmoo",
+                        status="blocked",
+                        updated_at=datetime.utcnow(),
+                    ),
+                )
+
+        self.assertEqual(status["status"], "blocked")
+        self.assertTrue(status["needs_update"])
 
     def test_tracking_cookies_do_not_count_as_platform_login(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -318,6 +360,46 @@ class PlatformStatusTests(unittest.TestCase):
             result = asyncio.run(auth.login_platform("reader", "readmoo"))
 
         self.assertEqual(result, expected)
+
+    def test_login_endpoint_returns_403_when_readmoo_is_waf_blocked(self):
+        with patch.object(
+            auth,
+            "login_and_save_platform_state",
+            AsyncMock(side_effect=platform_auth.PlatformLoginBlocked("blocked")),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(auth.login_platform("reader", "readmoo"))
+
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_wishlist_import_returns_platform_outcomes(self):
+        with (
+            patch(
+                "app.api.wishlist.import_readmoo_wishlist_to_db",
+                AsyncMock(return_value={
+                    "platform": "readmoo",
+                    "status": "blocked",
+                    "books": 0,
+                    "message": "blocked",
+                }),
+            ),
+            patch(
+                "app.api.wishlist.import_kobo_wishlist_to_db",
+                AsyncMock(return_value={
+                    "platform": "kobo",
+                    "status": "success",
+                    "books": 2,
+                    "message": "ok",
+                }),
+            ),
+        ):
+            result = asyncio.run(trigger_wishlist_import("reader"))
+
+        self.assertEqual(result["statuses"], {
+            "readmoo": "blocked",
+            "kobo": "success",
+        })
+        self.assertEqual(result["blocked"], ["readmoo"])
 
     def test_saved_state_excludes_unrelated_oauth_cookies(self):
         class FakeContext:

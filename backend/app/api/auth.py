@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from app.database import get_session  # 依您專案中的實例調整 (若為 get_db_session 請維持原樣)
 from app.models import PlatformSession
 from app.services.platform_auth import (
+    PlatformLoginBlocked,
     PlatformLoginTimeout,
     get_platform_auth_cookies,
     login_and_save_platform_state,
@@ -33,6 +34,8 @@ async def login_platform(user_id: str, platform: str):
         raise HTTPException(status_code=400, detail="不支援的電子書平台")
     try:
         return await login_and_save_platform_state(user_id, platform)
+    except PlatformLoginBlocked as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
     except PlatformLoginTimeout as error:
         raise HTTPException(status_code=408, detail=str(error)) from error
     except ValueError as error:
@@ -104,12 +107,12 @@ async def upload_cookies(payload: CookieUploadSchema, db: Session = Depends(get_
         db_session = PlatformSession(
             user_id=payload.user_id,
             platform=payload.platform,
-            status="active",
+            status="unverified",
             updated_at=datetime.utcnow()
         )
         db.add(db_session)
     else:
-        db_session.status = "active"
+        db_session.status = "unverified"
         db_session.updated_at = datetime.utcnow()
         
     db.commit()
@@ -138,7 +141,14 @@ def _inspect_platform_state(
         "cookie_count": 0,
         "message": "尚未建立登入憑證",
     }
+    database_status = db_record.status if db_record else None
     if not state_file.exists():
+        if database_status == "blocked":
+            return {
+                **base,
+                "status": "blocked",
+                "message": "平台安全驗證拒絕登入，請暫停重試並稍後再試",
+            }
         return base
 
     base["last_updated"] = _iso_from_timestamp(state_file.stat().st_mtime)
@@ -190,13 +200,44 @@ def _inspect_platform_state(
     if future_expirations:
         base["expires_at"] = _iso_from_timestamp(min(future_expirations))
 
-    database_status = db_record.status if db_record else None
-    if database_status == "expired" or not has_valid_cookie:
+    if not has_valid_cookie:
         return {
             **base,
             "status": "expired",
             "needs_update": True,
             "message": "登入憑證已失效，請重新登入更新 Cookie",
+        }
+
+    if database_status == "blocked":
+        return {
+            **base,
+            "status": "blocked",
+            "needs_update": True,
+            "message": "平台安全驗證拒絕登入，請暫停重試並稍後再試",
+        }
+
+    if database_status == "expired":
+        return {
+            **base,
+            "status": "expired",
+            "needs_update": True,
+            "message": "登入憑證已失效，請重新登入更新 Cookie",
+        }
+
+    if database_status == "parser_error":
+        return {
+            **base,
+            "status": "parser_error",
+            "needs_update": False,
+            "message": "登入憑證存在，但平台頁面格式無法確認；請稍後重新檢查",
+        }
+
+    if database_status != "active":
+        return {
+            **base,
+            "status": "unverified",
+            "needs_update": True,
+            "message": "憑證尚未通過最近一次平台驗證，請重新登入或同步測試",
         }
 
     return {
@@ -310,12 +351,12 @@ async def sync_from_local(user_id: str, platform: str, db: Session = Depends(get
         db_session = PlatformSession(
             user_id=user_id,
             platform=platform,
-            status="active",
+            status="unverified",
             updated_at=datetime.utcnow()
         )
         db.add(db_session)
     else:
-        db_session.status = "active"
+        db_session.status = "unverified"
         db_session.updated_at = datetime.utcnow()
         
     db.commit()

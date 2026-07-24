@@ -45,7 +45,9 @@ function PlatformStatusCard({
     name: status.platform,
     className: status.platform,
   };
-  const healthy = !status.needs_update;
+  const healthy = status.status === 'active' && !status.needs_update;
+  const canRelogin = ['missing', 'invalid', 'expired', 'blocked', 'unverified']
+    .includes(status.status);
 
   return (
     <article className={`status-card status-card--${meta.className}`}>
@@ -86,11 +88,13 @@ function PlatformStatusCard({
         <span>
           {healthy
             ? '可正常執行書櫃與待購清單同步'
-            : '請重新登入平台並更新 Cookie 憑證'}
+            : status.status === 'parser_error'
+              ? '憑證未被判定失效，請稍後重新檢查平台頁面'
+              : '請重新登入平台並更新 Cookie 憑證'}
         </span>
       </div>
 
-      {!healthy && (
+      {canRelogin && (
         <button
           type="button"
           className="platform-login-button"

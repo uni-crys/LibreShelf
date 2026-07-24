@@ -2,10 +2,14 @@
 import os
 import urllib.parse
 from pathlib import Path
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 from sqlmodel import Session, select
 from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
+from app.services.platform_auth import (
+    get_platform_auth_cookies,
+    set_platform_session_status,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -193,11 +197,65 @@ async def add_to_readmoo_wishlist(user_id: str, isbn: str):
 async def remove_from_readmoo_wishlist(user_id: str, isbn: str):
     await _execute_readmoo_wishlist_action(user_id, isbn, action="remove")
 
-async def import_readmoo_wishlist_to_db(user_id: str):
+async def _readmoo_import_page_status(page) -> str | None:
+    """Return a non-success status when the wishlist page is not usable."""
+    current_url = page.url.casefold()
+    if any(token in current_url for token in ("signin", "login", "oauth2")):
+        return "auth_required"
+
+    try:
+        body = (await page.locator("body").inner_text()).casefold()
+        cookies = await page.context.cookies()
+    except PlaywrightError:
+        return "parser_error"
+
+    if any(
+        marker in body
+        for marker in (
+            "max challenge attempts exceeded",
+            "challenge attempts exceeded",
+            "captcha challenge",
+        )
+    ):
+        return "blocked"
+
+    strong_auth_cookie = any(
+        cookie.get("name") in {"oauth_token", "oauth_refresh_token"}
+        or (
+            str(cookie.get("name", "")).startswith(
+                "CognitoIdentityServiceProvider."
+            )
+            and str(cookie.get("name", "")).endswith(
+                (".accessToken", ".idToken", ".refreshToken")
+            )
+        )
+        for cookie in get_platform_auth_cookies(cookies, "readmoo")
+    )
+    return None if strong_auth_cookie else "auth_required"
+
+
+async def _readmoo_explicitly_empty(page) -> bool:
+    empty_selector = (
+        ".cart-empty, .empty-cart, .empty-state, "
+        "text=/待購清單.*(?:沒有|尚無|目前無)/"
+    )
+    try:
+        return await page.locator(empty_selector).count() > 0
+    except PlaywrightError:
+        return False
+
+
+async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
     state_file_path = get_user_state_path(user_id)
     if not state_file_path.exists():
         print(f"[Readmoo Import] 找不到使用者 {user_id} 的憑證檔，無法同步")
-        return
+        set_platform_session_status(user_id, "readmoo", "expired")
+        return {
+            "platform": "readmoo",
+            "status": "auth_required",
+            "books": 0,
+            "message": "找不到 Readmoo 登入憑證，請重新登入",
+        }
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -212,11 +270,40 @@ async def import_readmoo_wishlist_to_db(user_id: str):
         try:
             print(f"[Readmoo Import] 開始同步遠端清單...")
             await page.goto("https://readmoo.com/checkout/cart#wishlist", wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(1500)
+
+            page_status = await _readmoo_import_page_status(page)
+            if page_status == "blocked":
+                set_platform_session_status(user_id, "readmoo", "blocked")
+                print("[Readmoo Import] 平台安全驗證拒絕存取，停止同步")
+                return {
+                    "platform": "readmoo",
+                    "status": "blocked",
+                    "books": 0,
+                    "message": "Readmoo 安全驗證拒絕登入，請暫停重試",
+                }
+            if page_status == "auth_required":
+                set_platform_session_status(user_id, "readmoo", "expired")
+                print("[Readmoo Import] 偵測到登入頁或失效憑證，停止同步")
+                return {
+                    "platform": "readmoo",
+                    "status": "auth_required",
+                    "books": 0,
+                    "message": "Readmoo 登入憑證已失效，請重新登入",
+                }
+            if page_status:
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "books": 0,
+                    "message": "無法確認 Readmoo 待購清單頁面狀態",
+                }
             
             # 等待清單列表渲染完成
             try:
                 await page.wait_for_selector("li.cart-list-item", timeout=10000)
-            except Exception:
+            except PlaywrightError:
                 print(f"[Readmoo Import] 等待 cart-list-item 逾時")
             
             await page.wait_for_timeout(2000)
@@ -224,6 +311,15 @@ async def import_readmoo_wishlist_to_db(user_id: str):
             # 💡 直接以每一個獨立的清單項目 (li.cart-list-item) 作為迴圈單位，避免重複抓取
             book_items = page.locator("li.cart-list-item") 
             count = await book_items.count()
+            if count == 0 and not await _readmoo_explicitly_empty(page):
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                print("[Readmoo Import] 找不到清單或明確空清單提示，停止同步")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "books": 0,
+                    "message": "Readmoo 頁面沒有可辨識的待購清單資料",
+                }
             print(f"[Readmoo Import] 遠端頁面共找到 {count} 個獨立書籍項目")
 
             for i in range(count):
@@ -235,7 +331,8 @@ async def import_readmoo_wishlist_to_db(user_id: str):
                     href = await title_el.get_attribute("href") if await title_el.count() > 0 else ""
                     
                     isbn = href.split("/")[-1] if href and "book/" in href else "UNKNOWN_ISBN"
-                except Exception:
+                except PlaywrightError as error:
+                    print(f"[Readmoo Import] 第 {i + 1} 筆資料解析失敗: {error}")
                     title = ""
                     isbn = "UNKNOWN_ISBN"
 
@@ -276,9 +373,23 @@ async def import_readmoo_wishlist_to_db(user_id: str):
                             db.add(wish_item)
 
                 db.commit()
+            set_platform_session_status(user_id, "readmoo", "active")
             print(f"[Readmoo Import] 資料庫同步完成！")
+            return {
+                "platform": "readmoo",
+                "status": "success",
+                "books": len(remote_books),
+                "message": f"Readmoo 待購清單同步完成（{len(remote_books)} 本）",
+            }
 
         except Exception as e:
             print(f"[Readmoo Import] 同步過程發生錯誤: {e}")
+            set_platform_session_status(user_id, "readmoo", "parser_error")
+            return {
+                "platform": "readmoo",
+                "status": "parser_error",
+                "books": 0,
+                "message": "Readmoo 待購清單同步失敗",
+            }
         finally:
             await browser.close()

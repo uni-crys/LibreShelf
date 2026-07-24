@@ -3,10 +3,11 @@ import os
 import urllib.parse
 import json
 from pathlib import Path
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 from sqlmodel import Session, select
 from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
+from app.services.platform_auth import set_platform_session_status
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -174,11 +175,39 @@ async def add_to_kobo_wishlist(user_id: str, isbn: str):
 async def remove_from_kobo_wishlist(user_id: str, isbn: str):
     await _execute_kobo_wishlist_action(user_id, isbn, action="remove")
 
-async def import_kobo_wishlist_to_db(user_id: str):
+async def _kobo_session_is_usable(page) -> bool:
+    """Check the authenticated account endpoint, not just the presence of cookies."""
+    if any(token in page.url.casefold() for token in ("signin", "login", "authorize")):
+        return False
+    try:
+        return bool(await page.evaluate("""
+            async () => {
+                try {
+                    const response = await fetch('/tw/zh/account', {
+                        credentials: 'include', redirect: 'follow'
+                    });
+                    return response.ok
+                        && !/(signin|login|authorize)/i.test(response.url);
+                } catch {
+                    return false;
+                }
+            }
+        """))
+    except PlaywrightError:
+        return False
+
+
+async def import_kobo_wishlist_to_db(user_id: str) -> dict:
     state_file_path = get_user_state_path(user_id)
     if not state_file_path.exists():
         print(f"[Kobo Import] 找不到使用者 {user_id} 的憑證檔，無法同步")
-        return
+        set_platform_session_status(user_id, "kobo", "expired")
+        return {
+            "platform": "kobo",
+            "status": "auth_required",
+            "books": 0,
+            "message": "找不到 Kobo 登入憑證，請重新登入",
+        }
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -194,6 +223,7 @@ async def import_kobo_wishlist_to_db(user_id: str):
         page = await context.new_page()
 
         remote_books = []
+        parsed_wishlist = False
 
         try:
             print(f"[Kobo Import] 開始同步遠端清單（透過內部 API）...")
@@ -201,6 +231,15 @@ async def import_kobo_wishlist_to_db(user_id: str):
             # 1. 先前往 Kobo 首頁或任意安全頁面建立 Cookie Session
             await page.goto("https://www.kobo.com/tw/zh", wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(2000)
+            if not await _kobo_session_is_usable(page):
+                set_platform_session_status(user_id, "kobo", "expired")
+                print("[Kobo Import] 偵測到登入頁或失效憑證，停止同步")
+                return {
+                    "platform": "kobo",
+                    "status": "auth_required",
+                    "books": 0,
+                    "message": "Kobo 登入憑證已失效，請重新登入",
+                }
 
             # 2. 直接在已經有登入 Cookie 的頁面環境下，用 fetch 呼叫官方的 wishlist fetch API
             print(f"[Kobo Import] 正在請求 Kobo 願望清單 API...")
@@ -222,6 +261,7 @@ async def import_kobo_wishlist_to_db(user_id: str):
             }""")
 
             if api_result and "Items" in api_result:
+                parsed_wishlist = True
                 items = api_result.get("Items", [])
                 print(f"[Kobo Import] 透過 API 成功取得 {len(items)} 本書")
                 
@@ -241,11 +281,22 @@ async def import_kobo_wishlist_to_db(user_id: str):
                     config_str = await wishlist_gizmo.get_attribute("data-kobo-gizmo-config")
                     if config_str:
                         config_data = json.loads(config_str)
+                        parsed_wishlist = "Items" in config_data
                         for item in config_data.get("Items", []):
                             isbn = item.get("ProductId", "UNKNOWN_ISBN")
                             title = item.get("Title", "未知書名")
                             if title and title != "未知書名":
                                 remote_books.append({"isbn": str(isbn).strip(), "title": title.strip()})
+
+            if not parsed_wishlist:
+                set_platform_session_status(user_id, "kobo", "parser_error")
+                print("[Kobo Import] 未取得可辨識的待購清單資料，停止同步")
+                return {
+                    "platform": "kobo",
+                    "status": "parser_error",
+                    "books": 0,
+                    "message": "Kobo 頁面沒有可辨識的待購清單資料",
+                }
 
             print(f"[Kobo Import] 確認同步的 Kobo 書籍數: {len(remote_books)}")
 
@@ -281,10 +332,23 @@ async def import_kobo_wishlist_to_db(user_id: str):
                             db.add(wish_item)
 
                 db.commit()
+            set_platform_session_status(user_id, "kobo", "active")
             print(f"[Kobo Import] 資料庫同步完成！")
+            return {
+                "platform": "kobo",
+                "status": "success",
+                "books": len(remote_books),
+                "message": f"Kobo 待購清單同步完成（{len(remote_books)} 本）",
+            }
 
         except Exception as e:
             print(f"[Kobo Import] 同步過程發生錯誤: {e}")
+            set_platform_session_status(user_id, "kobo", "parser_error")
+            return {
+                "platform": "kobo",
+                "status": "parser_error",
+                "books": 0,
+                "message": "Kobo 待購清單同步失敗",
+            }
         finally:
             await browser.close()
-

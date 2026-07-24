@@ -194,13 +194,46 @@ def _serialize_wishlist(
 
 
 @router.post("/import")
-def trigger_wishlist_import(
-    background_tasks: BackgroundTasks,
+async def trigger_wishlist_import(
     user_id: str = Query(..., description="使用者 ID"),
 ):
-    background_tasks.add_task(import_readmoo_wishlist_to_db, user_id)
-    background_tasks.add_task(import_kobo_wishlist_to_db, user_id)
-    return {"message": "已在背景啟動兩個平台的待購清單同步"}
+    # Run sequentially: each platform uses Chromium and a 4 GB VPS should not
+    # launch both browser sessions at once.  The response preserves the exact
+    # platform outcome so the UI never mistakes a failed login for an empty list.
+    results = [
+        await import_readmoo_wishlist_to_db(user_id),
+        await import_kobo_wishlist_to_db(user_id),
+    ]
+    statuses = {result["platform"]: result["status"] for result in results}
+    blocked = [
+        result["platform"] for result in results
+        if result["status"] == "blocked"
+    ]
+    needs_login = [
+        result["platform"] for result in results
+        if result["status"] == "auth_required"
+    ]
+    failures = [
+        result["platform"] for result in results
+        if result["status"] == "parser_error"
+    ]
+
+    if blocked:
+        message = f"{', '.join(blocked)} 被平台安全驗證拒絕，已停止同步"
+    elif needs_login:
+        message = f"{', '.join(needs_login)} 需要重新登入後才能同步"
+    elif failures:
+        message = f"{', '.join(failures)} 的待購清單頁面無法解析"
+    else:
+        message = "兩個平台的待購清單同步完成"
+
+    return {
+        "message": message,
+        "results": results,
+        "statuses": statuses,
+        "needs_login": needs_login,
+        "blocked": blocked,
+    }
 
 
 @router.get("/")
