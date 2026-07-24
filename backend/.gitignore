@@ -1,0 +1,8 @@
+# .gitignore
+.env
+.env.*
+__pycache__/
+*.db
+*.json
+readmoo_state.json
+kobo_state.json

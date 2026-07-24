@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Platform login credentials
+backend/user_profiles/
+backend/readmoo_state.json
+backend/kobo_state.json
+
+# Database
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Frontend
+node_modules/
+dist/
+coverage/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/

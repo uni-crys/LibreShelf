@@ -1,0 +1,290 @@
+# app/services/kobo_worker.py
+import os
+import urllib.parse
+import json
+from pathlib import Path
+from playwright.async_api import async_playwright
+from sqlmodel import Session, select
+from app.database import engine
+from app.models import WishlistItem, Book, PlatformSession
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# 透過環境變數控制，預設開啟隱藏模式
+IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "True").lower() == "true"
+
+def get_user_state_path(user_id: str) -> Path:
+    return BASE_DIR / "user_profiles" / user_id / "kobo" / "state.json"
+
+
+async def _execute_kobo_wishlist_action(user_id: str, isbn: str, action: str):
+    state_file_path = get_user_state_path(user_id)
+    
+    if not state_file_path.exists():
+        print(f"[Kobo Worker] 找不到使用者 {user_id} 的憑證檔 {state_file_path}")
+        _update_sync_status(user_id, isbn, "auth_expired")
+        return
+
+    book_title = None
+    with Session(engine) as db:
+        book = db.get(Book, isbn)
+        if book:
+            book_title = book.title
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=IS_HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--start-maximized",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-web-security"
+            ]
+        )
+        context = await browser.new_context(
+            storage_state=str(state_file_path),
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = await context.new_page()
+
+        try:
+            print(f"[Kobo Worker] 開始處理 ISBN: {isbn}，動作: {action}")
+
+            # 1. 進入首頁檢查是否過期
+            await page.goto("https://www.kobo.com/tw/zh", wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(2000)
+
+            if "/signin" in page.url or await page.locator("a:has-text('登入')").locator("visible=true").count() > 0:
+                print(f"[Kobo Worker] 偵測到使用者 {user_id} 的憑證已過期！")
+                _update_sync_status(user_id, isbn, "auth_expired")
+                
+                with Session(engine) as db:
+                    session_record = db.exec(
+                        select(PlatformSession).where(
+                            PlatformSession.user_id == user_id,
+                            PlatformSession.platform == "kobo"
+                        )
+                    ).first()
+                    if session_record:
+                        session_record.status = "expired"
+                        db.commit()
+                return
+
+            search_url = f"https://www.kobo.com/tw/zh/search?query={isbn}"
+            print(f"[Kobo Worker] 進入搜尋頁面...")
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(3000)
+
+            if "/ebook/" not in page.url:
+                print(f"[Kobo Worker] 停留在搜尋列表，尋找書籍連結...")
+                book_link = page.locator(".item-detail .title, a.title, h1.title a").first
+                
+                if await book_link.count() == 0 and book_title:
+                    print(f"[Kobo Worker] ISBN 無結果，改用書名搜尋...")
+                    search_url = f"https://www.kobo.com/tw/zh/search?query={urllib.parse.quote(book_title)}"
+                    await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                    await page.wait_for_timeout(3000)
+                    book_link = page.locator(".item-detail .title, a.title, h1.title a").first
+                
+                if "/ebook/" not in page.url:
+                    if await book_link.count() > 0:
+                        print(f"[Kobo Worker] 找到搜尋列表中的書籍，點擊進入內頁...")
+                        await book_link.click(force=True)
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(2000)
+                    else:
+                        print(f"[Kobo Worker] 在 Kobo 平台上找不到目標書籍")
+                        _update_sync_status(user_id, isbn, "failed")
+                        return
+            
+            print(f"[Kobo Worker] 已成功進入書籍內頁，準備操作願望清單...")
+
+            print(f"[Kobo Worker] 等待按鈕渲染...")
+            try:
+                await page.wait_for_selector("text='願望清單'", timeout=10000)
+            except Exception:
+                pass
+
+            wishlist_btn = page.locator("button:has-text('願望清單'), button:has-text('移除')").locator("visible=true").first
+
+            if await wishlist_btn.count() > 0:
+                btn_html = await wishlist_btn.evaluate("el => el.outerHTML")
+                btn_text = (await wishlist_btn.inner_text()).strip()
+                
+                is_already_in_wishlist = "移除" in btn_text or "remove-from-wishlist" in btn_html or "已在" in btn_text
+                print(f"[Kobo Worker] 找到願望清單按鈕，當前文字: [{btn_text}]")
+
+                if action == "add":
+                    if is_already_in_wishlist:
+                        print(f"[Kobo Worker] 該書籍原本就已在 Kobo 願望清單中。")
+                        _update_sync_status(user_id, isbn, "synced")
+                    else:
+                        print(f"[Kobo Worker] 執行點擊「新增至願望清單」...")
+                        await wishlist_btn.click(force=True)
+                        await page.wait_for_timeout(3000)
+                        print(f"[Kobo Worker] 成功點擊新增！")
+                        _update_sync_status(user_id, isbn, "synced")
+
+                elif action == "remove":
+                    if is_already_in_wishlist:
+                        print(f"[Kobo Worker] 執行點擊「移除」願望清單...")
+                        await wishlist_btn.click(force=True)
+                        await page.wait_for_timeout(3000)
+                        print(f"[Kobo Worker] 成功從願望清單移除！")
+                        _update_sync_status(user_id, isbn, "removed")
+                    else:
+                        print(f"[Kobo Worker] 該書籍原本就不在願望清單中，無須移除。")
+                        _update_sync_status(user_id, isbn, "removed")
+            else:
+                print(f"[Kobo Worker] 進入內頁後找不到願望清單按鈕")
+                _update_sync_status(user_id, isbn, "failed")
+
+        except Exception as e:
+            print(f"[Kobo Worker] 執行過程發生例外錯誤: {e}")
+            _update_sync_status(user_id, isbn, "failed")
+        finally:
+            await browser.close()
+
+def _update_sync_status(user_id: str, isbn: str, status: str):
+    try:
+        with Session(engine) as db:
+            statement = select(WishlistItem).where(
+                WishlistItem.user_id == user_id,
+                WishlistItem.isbn == isbn,
+                WishlistItem.platform == "kobo"
+            )
+            item = db.exec(statement).first()
+            if item:
+                item.sync_status = status
+                db.commit()
+                print(f"[Kobo Worker] 資料庫狀態已更新為: {status} (ISBN: {isbn})")
+    except Exception as e:
+        print(f"[Kobo Worker] 更新資料庫狀態失敗: {e}")
+
+# ==========================================
+# 對外開放的呼叫介面
+# ==========================================
+async def add_to_kobo_wishlist(user_id: str, isbn: str):
+    await _execute_kobo_wishlist_action(user_id, isbn, action="add")
+
+async def remove_from_kobo_wishlist(user_id: str, isbn: str):
+    await _execute_kobo_wishlist_action(user_id, isbn, action="remove")
+
+async def import_kobo_wishlist_to_db(user_id: str):
+    state_file_path = get_user_state_path(user_id)
+    if not state_file_path.exists():
+        print(f"[Kobo Import] 找不到使用者 {user_id} 的憑證檔，無法同步")
+        return
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=IS_HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            storage_state=str(state_file_path),
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = await context.new_page()
+
+        remote_books = []
+
+        try:
+            print(f"[Kobo Import] 開始同步遠端清單（透過內部 API）...")
+            
+            # 1. 先前往 Kobo 首頁或任意安全頁面建立 Cookie Session
+            await page.goto("https://www.kobo.com/tw/zh", wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(2000)
+
+            # 2. 直接在已經有登入 Cookie 的頁面環境下，用 fetch 呼叫官方的 wishlist fetch API
+            print(f"[Kobo Import] 正在請求 Kobo 願望清單 API...")
+            api_result = await page.evaluate("""async () => {
+                try {
+                    const response = await fetch('/tw/zh/account/wishlist/fetch', {
+                        method: 'GET',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*'
+                        }
+                    });
+                    if (response.ok) {
+                        return await response.json();
+                    }
+                    return null;
+                } catch (e) {
+                    return null;
+                }
+            }""")
+
+            if api_result and "Items" in api_result:
+                items = api_result.get("Items", [])
+                print(f"[Kobo Import] 透過 API 成功取得 {len(items)} 本書")
+                
+                for item in items:
+                    isbn = item.get("ProductId", "UNKNOWN_ISBN")
+                    title = item.get("Title", "未知書名")
+                    if title and title != "未知書名":
+                        remote_books.append({"isbn": str(isbn).strip(), "title": title.strip()})
+            else:
+                print(f"[Kobo Import] API 回傳資料格式不符或未取得內容，嘗試導向願望清單頁面...")
+                # 備用方案：如果 API 被擋，才退回原本的網頁導向
+                await page.goto("https://www.kobo.com/tw/zh/account/wishlist", wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(3000)
+                
+                wishlist_gizmo = page.locator(".wishlist-page[data-kobo-gizmo='Wishlist']").first
+                if await wishlist_gizmo.count() > 0:
+                    config_str = await wishlist_gizmo.get_attribute("data-kobo-gizmo-config")
+                    if config_str:
+                        config_data = json.loads(config_str)
+                        for item in config_data.get("Items", []):
+                            isbn = item.get("ProductId", "UNKNOWN_ISBN")
+                            title = item.get("Title", "未知書名")
+                            if title and title != "未知書名":
+                                remote_books.append({"isbn": str(isbn).strip(), "title": title.strip()})
+
+            print(f"[Kobo Import] 確認同步的 Kobo 書籍數: {len(remote_books)}")
+
+            with Session(engine) as db:
+                for b_info in remote_books:
+                    isbn = b_info["isbn"]
+                    title = b_info["title"]
+
+                    book = db.get(Book, isbn)
+                    if not book:
+                        book = Book(isbn=isbn, title=title)
+                        db.add(book)
+                        db.commit()
+
+                    statement = select(WishlistItem).where(
+                        WishlistItem.user_id == user_id,
+                        WishlistItem.isbn == isbn,
+                        WishlistItem.platform == "kobo"
+                    )
+                    wish_item = db.exec(statement).first()
+
+                    if not wish_item:
+                        new_wish_item = WishlistItem(
+                            user_id=user_id,
+                            isbn=isbn,
+                            platform="kobo",
+                            sync_status="synced"
+                        )
+                        db.add(new_wish_item)
+                    else:
+                        if wish_item.sync_status != "synced":
+                            wish_item.sync_status = "synced"
+                            db.add(wish_item)
+
+                db.commit()
+            print(f"[Kobo Import] 資料庫同步完成！")
+
+        except Exception as e:
+            print(f"[Kobo Import] 同步過程發生錯誤: {e}")
+        finally:
+            await browser.close()
+

@@ -1,0 +1,385 @@
+import asyncio
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from fastapi import BackgroundTasks, HTTPException
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine, select
+
+from app.api import auth
+from app.services import platform_auth
+from app.api.wishlist import (
+    WishlistCreate,
+    WishlistTransfer,
+    add_to_wishlist,
+    get_wishlist,
+    transfer_to_library,
+)
+from app.models import Book, PlatformSession, Purchase, WishlistItem
+
+
+class WishlistApiTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(self.engine)
+
+    def test_add_by_title_creates_book_and_two_platform_items(self):
+        metadata = {
+            "source": "readmoo",
+            "title": "測試書名",
+            "author": "測試作者",
+            "category": "文學小說",
+            "cover_url": "https://example.test/cover.jpg",
+            "identifiers": ["9789571078304"],
+        }
+        with (
+            Session(self.engine) as session,
+            patch(
+                "app.api.wishlist.fetch_and_clean_metadata",
+                AsyncMock(return_value=metadata),
+            ),
+        ):
+            result = asyncio.run(add_to_wishlist(
+                WishlistCreate(user_id="reader", query="測試書名"),
+                BackgroundTasks(),
+                session,
+            ))
+            items = session.exec(select(WishlistItem)).all()
+            book = session.get(Book, "9789571078304")
+
+        self.assertEqual(result["book"]["isbn"], "9789571078304")
+        self.assertEqual(book.title, "測試書名")
+        self.assertEqual(
+            {item.platform for item in items},
+            {"kobo", "readmoo"},
+        )
+
+    def test_wishlist_is_grouped_into_book_cards(self):
+        with Session(self.engine) as session:
+            session.add(Book(
+                isbn="book-a",
+                title="同一本書",
+                author="作者",
+                category="文學小說",
+            ))
+            session.add_all([
+                WishlistItem(
+                    user_id="reader",
+                    isbn="book-a",
+                    platform="kobo",
+                    sync_status="pending",
+                ),
+                WishlistItem(
+                    user_id="reader",
+                    isbn="book-a",
+                    platform="readmoo",
+                    sync_status="synced",
+                ),
+            ])
+            session.commit()
+            result = asyncio.run(get_wishlist(
+                user_id="reader",
+                session=session,
+            ))
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "同一本書")
+        self.assertEqual(len(result[0]["platforms"]), 2)
+
+    def test_add_by_title_refines_missing_fields_with_resolved_isbn(self):
+        first_match = {
+            "source": "readmoo",
+            "title": "待補資料書籍",
+            "author": "未知作者",
+            "category": "未分類",
+            "standard_category": "未分類",
+            "identifiers": ["9789571078304"],
+        }
+        exact_match = {
+            "source": "ncl",
+            "isbn": "9789571078304",
+            "isbn_valid": True,
+            "title": "待補資料書籍",
+            "author": "完整作者",
+            "category": "文學小說",
+            "standard_category": "文學小說",
+            "identifiers": ["9789571078304"],
+        }
+        metadata_lookup = AsyncMock(
+            side_effect=[first_match, exact_match],
+        )
+
+        with (
+            Session(self.engine) as session,
+            patch(
+                "app.api.wishlist.fetch_and_clean_metadata",
+                metadata_lookup,
+            ),
+        ):
+            result = asyncio.run(add_to_wishlist(
+                WishlistCreate(user_id="reader", query="待補資料書籍"),
+                BackgroundTasks(),
+                session,
+            ))
+
+        self.assertEqual(metadata_lookup.await_count, 2)
+        self.assertEqual(result["book"]["author"], "完整作者")
+        self.assertEqual(result["book"]["category"], "文學小說")
+
+    def test_get_wishlist_enriches_title_only_imported_book(self):
+        metadata = {
+            "source": "readmoo",
+            "isbn": "",
+            "isbn_valid": False,
+            "title": "遠端匯入書籍",
+            "author": "遠端作者",
+            "category": "人文社科",
+            "standard_category": "人文社科",
+            "cover_url": "https://example.test/imported.jpg",
+        }
+        with (
+            Session(self.engine) as session,
+            patch(
+                "app.api.wishlist.fetch_and_clean_metadata",
+                AsyncMock(return_value=metadata),
+            ),
+        ):
+            session.add(Book(
+                isbn="remote-platform-id",
+                title="遠端匯入書籍",
+                author="未知作者",
+                category="未分類",
+            ))
+            session.add(WishlistItem(
+                user_id="reader",
+                isbn="remote-platform-id",
+                platform="readmoo",
+                sync_status="synced",
+            ))
+            session.commit()
+
+            result = asyncio.run(get_wishlist(
+                user_id="reader",
+                session=session,
+            ))
+
+        self.assertEqual(result[0]["author"], "遠端作者")
+        self.assertEqual(result[0]["category"], "人文社科")
+        self.assertEqual(
+            result[0]["cover_url"],
+            "https://example.test/imported.jpg",
+        )
+
+    def test_bulk_transfer_rejects_two_platforms(self):
+        with Session(self.engine) as session:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(transfer_to_library(
+                    WishlistTransfer(
+                        user_id="reader",
+                        isbns=["book-a", "book-b"],
+                        platforms=["kobo", "readmoo"],
+                    ),
+                    BackgroundTasks(),
+                    session,
+                ))
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_bulk_transfer_to_one_platform_creates_purchases(self):
+        with Session(self.engine) as session:
+            for isbn in ("book-a", "book-b"):
+                session.add(Book(
+                    isbn=isbn,
+                    title=isbn,
+                    category="文學小說",
+                ))
+                session.add(WishlistItem(
+                    user_id="reader",
+                    isbn=isbn,
+                    platform="readmoo",
+                    sync_status="synced",
+                ))
+            session.commit()
+
+            asyncio.run(transfer_to_library(
+                WishlistTransfer(
+                    user_id="reader",
+                    isbns=["book-a", "book-b"],
+                    platforms=["kobo"],
+                ),
+                BackgroundTasks(),
+                session,
+            ))
+            purchases = session.exec(select(Purchase)).all()
+            wishlist_items = session.exec(select(WishlistItem)).all()
+
+        self.assertEqual(
+            {(row.isbn, row.platform) for row in purchases},
+            {("book-a", "kobo"), ("book-b", "kobo")},
+        )
+        self.assertEqual(wishlist_items, [])
+
+
+class PlatformStatusTests(unittest.TestCase):
+    def test_missing_state_requires_update(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(auth, "BASE_DIR", Path(temporary_directory)):
+                status = auth._inspect_platform_state(
+                    "reader",
+                    "kobo",
+                    None,
+                )
+
+        self.assertEqual(status["status"], "missing")
+        self.assertTrue(status["needs_update"])
+
+    def test_session_cookie_is_active_unless_database_marks_expired(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = (
+                Path(temporary_directory)
+                / "user_profiles"
+                / "reader"
+                / "readmoo"
+            )
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").write_text(
+                (
+                    '{"cookies":[{"name":"oauth_token","value":"ok",'
+                    '"domain":"read.readmoo.com","expires":-1}]}'
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(auth, "BASE_DIR", Path(temporary_directory)):
+                active = auth._inspect_platform_state(
+                    "reader",
+                    "readmoo",
+                    None,
+                )
+                expired = auth._inspect_platform_state(
+                    "reader",
+                    "readmoo",
+                    PlatformSession(
+                        user_id="reader",
+                        platform="readmoo",
+                        status="expired",
+                        updated_at=datetime.utcnow(),
+                    ),
+                )
+
+        self.assertEqual(active["status"], "active")
+        self.assertFalse(active["needs_update"])
+        self.assertEqual(expired["status"], "expired")
+        self.assertTrue(expired["needs_update"])
+
+    def test_tracking_cookies_do_not_count_as_platform_login(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = (
+                Path(temporary_directory)
+                / "user_profiles"
+                / "reader"
+                / "kobo"
+            )
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").write_text(
+                (
+                    '{"cookies":[{"name":"_ga","value":"tracking",'
+                    '"domain":".kobo.com","expires":-1}]}'
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(auth, "BASE_DIR", Path(temporary_directory)):
+                status = auth._inspect_platform_state(
+                    "reader",
+                    "kobo",
+                    None,
+                )
+
+        self.assertEqual(status["status"], "expired")
+        self.assertTrue(status["needs_update"])
+
+    def test_login_endpoint_returns_saved_cookie_result(self):
+        expected = {
+            "status": "success",
+            "platform": "readmoo",
+            "cookie_count": 3,
+            "message": "readmoo 登入憑證已更新",
+        }
+        with patch.object(
+            auth,
+            "login_and_save_platform_state",
+            AsyncMock(return_value=expected),
+        ):
+            result = asyncio.run(auth.login_platform("reader", "readmoo"))
+
+        self.assertEqual(result, expected)
+
+    def test_saved_state_excludes_unrelated_oauth_cookies(self):
+        class FakeContext:
+            async def storage_state(self):
+                return {
+                    "cookies": [
+                        {
+                            "name": "oauth_token",
+                            "domain": "read.readmoo.com",
+                            "value": "book-session",
+                        },
+                        {
+                            "name": "SID",
+                            "domain": ".google.com",
+                            "value": "unrelated",
+                        },
+                    ],
+                    "origins": [],
+                }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            state = asyncio.run(platform_auth.save_platform_storage_state(
+                FakeContext(),
+                state_path,
+                "readmoo",
+            ))
+
+        self.assertEqual(len(state["cookies"]), 1)
+        self.assertEqual(state["cookies"][0]["name"], "oauth_token")
+
+
+class LibraryImportResultTests(unittest.TestCase):
+    def test_auth_required_platform_is_returned_to_frontend(self):
+        from main import import_library
+
+        with (
+            patch(
+                "main.import_readmoo_library_to_db",
+                AsyncMock(return_value={
+                    "platform": "readmoo",
+                    "status": "auth_required",
+                    "message": "Readmoo 登入憑證已失效",
+                    "new_books": 0,
+                }),
+            ),
+            patch(
+                "main.import_kobo_library_to_db",
+                AsyncMock(return_value={
+                    "platform": "kobo",
+                    "status": "success",
+                    "message": "Kobo 書櫃同步完成",
+                    "new_books": 1,
+                }),
+            ),
+        ):
+            result = asyncio.run(import_library("reader", limit=None))
+
+        self.assertEqual(result["status"], "auth_required")
+        self.assertEqual(result["needs_auth"], ["readmoo"])
+        self.assertEqual(len(result["results"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
