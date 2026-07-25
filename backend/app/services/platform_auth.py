@@ -247,6 +247,39 @@ async def verify_readmoo_reader_session(page) -> str:
     return "active" if login_visible == 0 and len(body_text) > 20 else "auth_required"
 
 
+async def verify_readmoo_storefront_session(page) -> str:
+    """Check the storefront before a wishlist import uses its cart route."""
+    try:
+        await page.goto(
+            "https://readmoo.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await page.wait_for_timeout(3000)
+    except PlaywrightError:
+        return "auth_required"
+
+    if await _readmoo_login_is_blocked(page):
+        return "blocked"
+    if any(
+        token in page.url.casefold()
+        for token in ("signin", "login", "oauth2")
+    ):
+        return "auth_required"
+    try:
+        auth_cookies = get_platform_auth_cookies(
+            await page.context.cookies(),
+            "readmoo",
+        )
+        login_visible = await page.locator(
+            "a:has-text('登入'):visible, button:has-text('登入'):visible"
+        ).count()
+        body_text = (await page.locator("body").inner_text()).strip()
+    except PlaywrightError:
+        return "auth_required"
+    return "active" if auth_cookies and login_visible == 0 and len(body_text) > 20 else "auth_required"
+
+
 async def login_and_save_platform_state(
     user_id: str,
     platform: str,
