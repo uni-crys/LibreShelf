@@ -15,6 +15,7 @@ from app.models import PlatformSession
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 SUPPORTED_PLATFORMS = {"readmoo", "kobo"}
 LOGIN_TIMEOUT_SECONDS = 180
+READMOO_LOGIN_SETTLE_SECONDS = 8
 _SAFE_USER_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -311,6 +312,7 @@ async def login_and_save_platform_state(
         )
         page = await context.new_page()
         status_recorded = False
+        readmoo_cookie_seen_at: float | None = None
 
         try:
             await page.goto(
@@ -330,13 +332,24 @@ async def login_and_save_platform_state(
                         "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
                     )
                 # Never navigate while the user is completing OAuth/login in
-                # the visible browser.  Only run the verification redirects
-                # after a fresh authenticated cookie has appeared.
+                # the visible browser.  Readmoo may require several attempts;
+                # only leave its homepage after the authenticated state has
+                # stayed stable for a short period.
                 if not await _is_logged_in(page, platform):
+                    readmoo_cookie_seen_at = None
                     await asyncio.sleep(1)
                     continue
 
                 if platform == "readmoo":
+                    now = asyncio.get_running_loop().time()
+                    if readmoo_cookie_seen_at is None:
+                        readmoo_cookie_seen_at = now
+                        await asyncio.sleep(1)
+                        continue
+                    if now - readmoo_cookie_seen_at < READMOO_LOGIN_SETTLE_SECONDS:
+                        await asyncio.sleep(1)
+                        continue
+
                     # 1. Confirm that the storefront has consumed the login
                     # cookies, then 2. confirm that the reader subdomain can
                     # use the same browser context before saving it.
