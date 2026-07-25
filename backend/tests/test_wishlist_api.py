@@ -480,6 +480,18 @@ class PlatformStatusTests(unittest.TestCase):
 
         self.assertEqual(result, expected)
 
+    def test_readmoo_callback_must_finish_before_login_redirects(self):
+        class FakePage:
+            def __init__(self, url):
+                self.url = url
+
+        self.assertFalse(platform_auth._readmoo_storefront_callback_completed(
+            FakePage("https://www.readmoo.com/?key=true"),
+        ))
+        self.assertTrue(platform_auth._readmoo_storefront_callback_completed(
+            FakePage("https://www.readmoo.com/"),
+        ))
+
     def test_login_endpoint_returns_403_when_readmoo_is_waf_blocked(self):
         with patch.object(
             auth,

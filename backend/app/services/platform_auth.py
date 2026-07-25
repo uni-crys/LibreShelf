@@ -3,7 +3,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Error as PlaywrightError, async_playwright
 from sqlmodel import Session, select
@@ -256,17 +256,32 @@ async def verify_readmoo_reader_session(page) -> str:
     ) else "auth_required"
 
 
-async def verify_readmoo_storefront_session(page) -> str:
+def _readmoo_storefront_callback_completed(page) -> bool:
+    parsed = urlparse(page.url)
+    hostname = (parsed.hostname or "").casefold()
+    callback_key = parse_qs(parsed.query).get("key", [])
+    return (
+        hostname in {"readmoo.com", "www.readmoo.com"}
+        and "true" not in {value.casefold() for value in callback_key}
+    )
+
+
+async def verify_readmoo_storefront_session(
+    page,
+    *,
+    navigate: bool = True,
+) -> str:
     """Check the storefront before a wishlist import uses its cart route."""
-    try:
-        await page.goto(
-            "https://readmoo.com/",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        await page.wait_for_timeout(3000)
-    except PlaywrightError:
-        return "auth_required"
+    if navigate:
+        try:
+            await page.goto(
+                "https://readmoo.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await page.wait_for_timeout(3000)
+        except PlaywrightError:
+            return "auth_required"
 
     if await _readmoo_login_is_blocked(page):
         return "blocked"
@@ -350,11 +365,19 @@ async def login_and_save_platform_state(
                         await asyncio.sleep(1)
                         continue
 
+                    # OAuth may expose cookies before Readmoo completes its
+                    # `key=true` callback. Stay on the visible page until the
+                    # browser naturally returns to the real storefront URL.
+                    if not _readmoo_storefront_callback_completed(page):
+                        await asyncio.sleep(1)
+                        continue
+
                     # 1. Confirm that the storefront has consumed the login
                     # cookies, then 2. confirm that the reader subdomain can
                     # use the same browser context before saving it.
                     storefront_status = await verify_readmoo_storefront_session(
                         page,
+                        navigate=False,
                     )
                     if storefront_status == "blocked":
                         raise PlatformLoginBlocked(
