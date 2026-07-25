@@ -218,7 +218,7 @@ async def _readmoo_login_is_blocked(page) -> bool:
     )
 
 
-async def _verify_readmoo_reader_session(page) -> str:
+async def verify_readmoo_reader_session(page) -> str:
     """Validate the post-login reader session before persisting state.json."""
     try:
         await page.goto(
@@ -290,7 +290,7 @@ async def login_and_save_platform_state(
                     )
                 if await _is_logged_in(page, platform):
                     if platform == "readmoo":
-                        reader_status = await _verify_readmoo_reader_session(
+                        reader_status = await verify_readmoo_reader_session(
                             page,
                         )
                         if reader_status == "blocked":

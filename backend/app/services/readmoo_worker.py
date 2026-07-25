@@ -8,7 +8,9 @@ from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
 from app.services.platform_auth import (
     get_platform_auth_cookies,
+    save_platform_storage_state,
     set_platform_session_status,
+    verify_readmoo_reader_session,
 )
 from app.services.wishlist_reconciliation import (
     remove_stale_synced_wishlist_items,
@@ -275,6 +277,37 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
 
         try:
             print(f"[Readmoo Import] 開始同步遠端清單...")
+
+            # The wishlist page is a different Readmoo surface from the reader.
+            # Confirm the freshly-loaded storage state in the reader first and
+            # persist any refreshed cookies before visiting the wishlist page.
+            reader_status = await verify_readmoo_reader_session(page)
+            if reader_status == "blocked":
+                set_platform_session_status(user_id, "readmoo", "blocked")
+                print("[Readmoo Import] 閱讀器遭平台安全驗證拒絕，停止同步")
+                return {
+                    "platform": "readmoo",
+                    "status": "blocked",
+                    "books": 0,
+                    "message": "Readmoo 安全驗證拒絕登入，請暫停重試",
+                }
+            if reader_status != "active":
+                set_platform_session_status(user_id, "readmoo", "expired")
+                print("[Readmoo Import] 閱讀器登入驗證失敗，停止同步")
+                return {
+                    "platform": "readmoo",
+                    "status": "auth_required",
+                    "books": 0,
+                    "message": "Readmoo 登入憑證已失效，請重新登入",
+                }
+
+            await save_platform_storage_state(
+                context,
+                state_file_path,
+                "readmoo",
+            )
+            print("[Readmoo Import] 已驗證閱讀器登入並更新 state.json")
+
             await page.goto("https://readmoo.com/checkout/cart#wishlist", wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(1500)
 
@@ -289,13 +322,16 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
                     "message": "Readmoo 安全驗證拒絕登入，請暫停重試",
                 }
             if page_status == "auth_required":
-                set_platform_session_status(user_id, "readmoo", "expired")
-                print("[Readmoo Import] 偵測到登入頁或失效憑證，停止同步")
+                # The reader session was just verified.  A login redirect here
+                # means the legacy wishlist route no longer accepts that session,
+                # not that state.json is necessarily invalid.
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                print("[Readmoo Import] 待購頁要求登入，但閱讀器 session 已驗證")
                 return {
                     "platform": "readmoo",
-                    "status": "auth_required",
+                    "status": "parser_error",
                     "books": 0,
-                    "message": "Readmoo 登入憑證已失效，請重新登入",
+                    "message": "Readmoo 待購清單路徑無法使用目前已驗證的登入 session",
                 }
             if page_status:
                 set_platform_session_status(user_id, "readmoo", "parser_error")
