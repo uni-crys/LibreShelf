@@ -16,8 +16,11 @@ from app.services.wishlist_reconciliation import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-# 透過環境變數控制，預設開啟隱藏模式
-IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "True").lower() == "true"
+# Readmoo rejects the authenticated reader site from a headless Chromium
+# context.  Keep this aligned with readmoo_library_worker: Xvfb/noVNC provides
+# the display in production, while PLAYWRIGHT_HEADLESS=true remains available
+# for an explicit local diagnostic.
+IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "False").lower() == "true"
 
 def get_user_state_path(user_id: str) -> Path:
     return BASE_DIR / "user_profiles" / user_id / "readmoo" / "state.json"
@@ -202,10 +205,6 @@ async def remove_from_readmoo_wishlist(user_id: str, isbn: str):
 
 async def _readmoo_import_page_status(page) -> str | None:
     """Return a non-success status when the wishlist page is not usable."""
-    current_url = page.url.casefold()
-    if any(token in current_url for token in ("signin", "login", "oauth2")):
-        return "auth_required"
-
     try:
         body = (await page.locator("body").inner_text()).casefold()
         cookies = await page.context.cookies()
@@ -221,6 +220,10 @@ async def _readmoo_import_page_status(page) -> str | None:
         )
     ):
         return "blocked"
+
+    current_url = page.url.casefold()
+    if any(token in current_url for token in ("signin", "login", "oauth2")):
+        return "auth_required"
 
     strong_auth_cookie = any(
         cookie.get("name") in {"oauth_token", "oauth_refresh_token"}

@@ -218,6 +218,35 @@ async def _readmoo_login_is_blocked(page) -> bool:
     )
 
 
+async def _verify_readmoo_reader_session(page) -> str:
+    """Validate the post-login reader session before persisting state.json."""
+    try:
+        await page.goto(
+            "https://read.readmoo.com/#/dashboard",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await page.wait_for_timeout(3000)
+    except PlaywrightError:
+        return "auth_required"
+
+    if await _readmoo_login_is_blocked(page):
+        return "blocked"
+    if any(
+        token in page.url.casefold()
+        for token in ("signin", "login", "oauth2")
+    ):
+        return "auth_required"
+    try:
+        login_visible = await page.locator(
+            "a:has-text('登入'):visible, button:has-text('登入'):visible"
+        ).count()
+        body_text = (await page.locator("body").inner_text()).strip()
+    except PlaywrightError:
+        return "auth_required"
+    return "active" if login_visible == 0 and len(body_text) > 20 else "auth_required"
+
+
 async def login_and_save_platform_state(
     user_id: str,
     platform: str,
@@ -260,6 +289,17 @@ async def login_and_save_platform_state(
                         "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
                     )
                 if await _is_logged_in(page, platform):
+                    if platform == "readmoo":
+                        reader_status = await _verify_readmoo_reader_session(
+                            page,
+                        )
+                        if reader_status == "blocked":
+                            raise PlatformLoginBlocked(
+                                "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
+                            )
+                        if reader_status != "active":
+                            await asyncio.sleep(1)
+                            continue
                     state = await save_platform_storage_state(
                         context,
                         state_path,
