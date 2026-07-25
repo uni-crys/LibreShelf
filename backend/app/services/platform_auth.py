@@ -238,13 +238,21 @@ async def verify_readmoo_reader_session(page) -> str:
     ):
         return "auth_required"
     try:
+        auth_cookies = get_platform_auth_cookies(
+            await page.context.cookies(),
+            "readmoo",
+        )
         login_visible = await page.locator(
             "a:has-text('登入'):visible, button:has-text('登入'):visible"
         ).count()
         body_text = (await page.locator("body").inner_text()).strip()
     except PlaywrightError:
         return "auth_required"
-    return "active" if login_visible == 0 and len(body_text) > 20 else "auth_required"
+    return "active" if (
+        auth_cookies
+        and login_visible == 0
+        and len(body_text) > 20
+    ) else "auth_required"
 
 
 async def verify_readmoo_storefront_session(page) -> str:
@@ -321,18 +329,35 @@ async def login_and_save_platform_state(
                     raise PlatformLoginBlocked(
                         "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
                     )
-                if await _is_logged_in(page, platform):
-                    if platform == "readmoo":
-                        reader_status = await verify_readmoo_reader_session(
-                            page,
+                if platform == "readmoo":
+                    # 1. Confirm that the storefront has consumed the login
+                    # cookies, then 2. confirm that the reader subdomain can
+                    # use the same browser context before saving it.
+                    storefront_status = await verify_readmoo_storefront_session(
+                        page,
+                    )
+                    if storefront_status == "blocked":
+                        raise PlatformLoginBlocked(
+                            "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
                         )
-                        if reader_status == "blocked":
-                            raise PlatformLoginBlocked(
-                                "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
-                            )
-                        if reader_status != "active":
-                            await asyncio.sleep(1)
-                            continue
+                    if storefront_status != "active":
+                        await asyncio.sleep(1)
+                        continue
+
+                    reader_status = await verify_readmoo_reader_session(page)
+                    if reader_status == "blocked":
+                        raise PlatformLoginBlocked(
+                            "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
+                        )
+                    if reader_status != "active":
+                        await asyncio.sleep(1)
+                        continue
+
+                elif not await _is_logged_in(page, platform):
+                    await asyncio.sleep(1)
+                    continue
+
+                if platform in {"readmoo", "kobo"}:
                     state = await save_platform_storage_state(
                         context,
                         state_path,
