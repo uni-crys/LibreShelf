@@ -61,10 +61,13 @@ cd "/Users/crystal/VS code/Github/LibreShelf/backend"
 source ../.venv/bin/activate
 PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
   --user-id test_user_001 \
+  --limit 3 \
   --skip-wishlist
 ```
 
 待購清單解析確認後，移除 `--skip-wishlist`。只有本機待購同步回傳 `success` 時，agent 才會將 Readmoo 待購 snapshot 上傳並在 VPS 執行雙向對帳；失敗時 VPS 既有待購資料會保留。
+
+`--limit 3` 是首次測試建議值，限制本次新增到本機資料庫並上傳的新書數；確認正確後可移除 `--limit` 做完整同步。
 
 ### 啟動後端
 
@@ -74,7 +77,7 @@ PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
 cd "/Users/crystal/VS code/Github/LibreShelf"
 source .venv/bin/activate
 cd backend
-python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn main:app
 ```
 
 後端健康檢查：

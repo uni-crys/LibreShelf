@@ -147,7 +147,9 @@ def apply_readmoo_snapshot(
         )
 
     db.commit()
-    set_platform_session_status(payload.user_id, "readmoo", "active")
+    # The VPS received a trusted snapshot, but it does not possess the Mac's
+    # browser session. Do not advertise this as a VPS-login-capable session.
+    set_platform_session_status(payload.user_id, "readmoo", "remote_synced")
     return {
         "books_received": len(payload.books),
         "purchases_added": purchases_added,

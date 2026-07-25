@@ -421,6 +421,23 @@ class PlatformStatusTests(unittest.TestCase):
         self.assertEqual(status["status"], "blocked")
         self.assertTrue(status["needs_update"])
 
+    def test_remote_readmoo_sync_is_not_reported_as_vps_login(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(auth, "BASE_DIR", Path(temporary_directory)):
+                status = auth._inspect_platform_state(
+                    "reader",
+                    "readmoo",
+                    PlatformSession(
+                        user_id="reader",
+                        platform="readmoo",
+                        status="remote_synced",
+                        updated_at=datetime.utcnow(),
+                    ),
+                )
+
+        self.assertEqual(status["status"], "remote_synced")
+        self.assertFalse(status["needs_update"])
+
     def test_tracking_cookies_do_not_count_as_platform_login(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_dir = (

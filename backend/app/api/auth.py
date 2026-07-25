@@ -142,6 +142,21 @@ def _inspect_platform_state(
         "message": "尚未建立登入憑證",
     }
     database_status = db_record.status if db_record else None
+
+    def remote_synced_status() -> dict:
+        last_updated = base["last_updated"]
+        if db_record and db_record.updated_at:
+            last_updated = db_record.updated_at.replace(
+                tzinfo=timezone.utc,
+            ).isoformat()
+        return {
+            **base,
+            "status": "remote_synced",
+            "needs_update": False,
+            "last_updated": last_updated,
+            "message": "資料已由本機 Readmoo 同步；VPS 不直接使用登入憑證",
+        }
+
     if not state_file.exists():
         if database_status == "blocked":
             return {
@@ -149,6 +164,8 @@ def _inspect_platform_state(
                 "status": "blocked",
                 "message": "平台安全驗證拒絕登入，請暫停重試並稍後再試",
             }
+        if database_status == "remote_synced":
+            return remote_synced_status()
         return base
 
     base["last_updated"] = _iso_from_timestamp(state_file.stat().st_mtime)
@@ -170,6 +187,8 @@ def _inspect_platform_state(
     ]
     base["cookie_count"] = len(cookies)
     if not cookies:
+        if database_status == "remote_synced":
+            return remote_synced_status()
         return {
             **base,
             "status": "invalid",
@@ -178,6 +197,8 @@ def _inspect_platform_state(
 
     auth_cookies = get_platform_auth_cookies(cookies, platform)
     if not auth_cookies:
+        if database_status == "remote_synced":
+            return remote_synced_status()
         return {
             **base,
             "status": "expired",
@@ -199,6 +220,9 @@ def _inspect_platform_state(
     has_valid_cookie = has_session_cookie or bool(future_expirations)
     if future_expirations:
         base["expires_at"] = _iso_from_timestamp(min(future_expirations))
+
+    if database_status == "remote_synced":
+        return remote_synced_status()
 
     if not has_valid_cookie:
         return {

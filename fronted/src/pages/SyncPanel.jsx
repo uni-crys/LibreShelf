@@ -45,7 +45,9 @@ function PlatformStatusCard({
     name: status.platform,
     className: status.platform,
   };
-  const healthy = status.status === 'active' && !status.needs_update;
+  const isRemoteSynced = status.status === 'remote_synced';
+  const healthy = ['active', 'remote_synced'].includes(status.status)
+    && !status.needs_update;
   const canRelogin = ['missing', 'invalid', 'expired', 'blocked', 'unverified']
     .includes(status.status);
 
@@ -57,7 +59,9 @@ function PlatformStatusCard({
         </div>
         <span className={`health-badge ${healthy ? 'is-healthy' : 'needs-action'}`}>
           {healthy ? <CheckCircle2 /> : <AlertTriangle />}
-          {healthy ? '連線可用' : '需要更新'}
+          {healthy
+            ? isRemoteSynced ? '本機已同步' : '連線可用'
+            : '需要更新'}
         </span>
       </div>
 
@@ -87,7 +91,9 @@ function PlatformStatusCard({
         {healthy ? <ShieldCheck /> : <AlertTriangle />}
         <span>
           {healthy
-            ? '可正常執行書櫃與待購清單同步'
+            ? isRemoteSynced
+              ? '資料由本機同步代理更新；VPS 不直接登入 Readmoo'
+              : '可正常執行書櫃與待購清單同步'
             : status.status === 'parser_error'
               ? '憑證未被判定失效，請稍後重新檢查平台頁面'
               : '請重新登入平台並更新 Cookie 憑證'}

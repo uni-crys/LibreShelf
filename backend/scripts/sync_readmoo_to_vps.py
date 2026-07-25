@@ -88,7 +88,7 @@ async def upload_snapshot(snapshot: dict, vps_url: str, token: str) -> dict:
         return response.json()
 
 
-async def run(user_id: str, skip_wishlist: bool) -> int:
+async def run(user_id: str, skip_wishlist: bool, limit: int | None) -> int:
     vps_url = os.getenv("READMOO_SYNC_VPS_URL", "").strip()
     sync_token = os.getenv("READMOO_SYNC_TOKEN", "").strip()
     if not vps_url or not sync_token:
@@ -99,7 +99,7 @@ async def run(user_id: str, skip_wishlist: bool) -> int:
         )
         return 2
 
-    library_result = await import_readmoo_library_to_db(user_id)
+    library_result = await import_readmoo_library_to_db(user_id, limit=limit)
     print("[Local Readmoo Agent] 書櫃結果:", library_result)
     if library_result.get("status") != "success":
         print("[Local Readmoo Agent] 書櫃未成功，不上傳不完整 snapshot")
@@ -135,12 +135,20 @@ def main() -> int:
     )
     parser.add_argument("--user-id", required=True)
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="本次最多新增幾本 Readmoo 書櫃書籍；省略則不限制",
+    )
+    parser.add_argument(
         "--skip-wishlist",
         action="store_true",
         help="僅同步並上傳 Readmoo 書櫃，不碰待購清單",
     )
     args = parser.parse_args()
-    return asyncio.run(run(args.user_id, args.skip_wishlist))
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit 必須大於 0")
+    return asyncio.run(run(args.user_id, args.skip_wishlist, args.limit))
 
 
 if __name__ == "__main__":
