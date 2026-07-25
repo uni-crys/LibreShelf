@@ -8,7 +8,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlmodel import SQLModel
 from contextlib import asynccontextmanager
 from app.database import engine
-from app.api import wishlist, books, auth
+from app.api import auth, books, readmoo_replication, wishlist
 from app.services.readmoo_worker import import_readmoo_wishlist_to_db
 from app.services.readmoo_library_worker import import_readmoo_library_to_db
 from app.services.kobo_worker import import_kobo_wishlist_to_db
@@ -33,6 +33,11 @@ app.add_middleware(
 app.include_router(wishlist.router, prefix="/wishlist", tags=["Wishlist"])
 app.include_router(books.router, prefix="/books", tags=["Books"])
 app.include_router(auth.router,prefix = "/auth", tags=["Auth"])
+app.include_router(
+    readmoo_replication.router,
+    prefix="/internal",
+    tags=["Readmoo replication"],
+)
 
 # 初始化背景排程器
 scheduler = BackgroundScheduler()

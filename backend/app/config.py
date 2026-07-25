@@ -12,5 +12,6 @@ class Settings(BaseSettings):
     )
 
     GOOGLE_BOOKS_API_KEY: str = ""
+    READMOO_SYNC_TOKEN: str = ""
 
 settings = Settings()

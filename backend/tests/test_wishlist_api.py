@@ -9,7 +9,7 @@ from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.api import auth
+from app.api import auth, readmoo_replication
 from app.services import platform_auth
 from app.services.wishlist_reconciliation import (
     remove_stale_synced_wishlist_items,
@@ -137,6 +137,63 @@ class WishlistApiTests(unittest.TestCase):
         self.assertEqual(
             {(item.isbn, item.platform) for item in items},
             {("keep", "kobo"), ("pending", "kobo"), ("gone", "readmoo")},
+        )
+
+    def test_local_readmoo_snapshot_upserts_without_cookie_data(self):
+        payload = readmoo_replication.ReadmooSnapshotPayload(
+            user_id="reader",
+            books=[
+                readmoo_replication.ReadmooBookPayload(
+                    isbn="owned-book",
+                    title="本機書櫃書籍",
+                    author="本機作者",
+                    category="文學小說",
+                    platform_book_id="readmoo-product-1",
+                ),
+            ],
+            wishlist_synced=True,
+            wishlist=[
+                readmoo_replication.ReadmooBookPayload(
+                    isbn="wanted-book",
+                    title="本機待購書籍",
+                    category="人文社科",
+                ),
+            ],
+        )
+        with Session(self.engine) as session:
+            session.add_all([
+                Book(isbn="stale-book", title="舊待購", category="未分類"),
+                WishlistItem(
+                    user_id="reader",
+                    isbn="stale-book",
+                    platform="readmoo",
+                    sync_status="synced",
+                ),
+                WishlistItem(
+                    user_id="reader",
+                    isbn="stale-book",
+                    platform="kobo",
+                    sync_status="synced",
+                ),
+            ])
+            session.commit()
+            with patch.object(readmoo_replication, "set_platform_session_status"):
+                result = readmoo_replication.apply_readmoo_snapshot(
+                    session,
+                    payload,
+                )
+            purchases = session.exec(select(Purchase)).all()
+            wish_items = session.exec(select(WishlistItem)).all()
+
+        self.assertEqual(result["purchases_added"], 1)
+        self.assertEqual(result["wishlist_removed"], 1)
+        self.assertEqual(
+            {(purchase.isbn, purchase.platform) for purchase in purchases},
+            {("owned-book", "readmoo")},
+        )
+        self.assertEqual(
+            {(item.isbn, item.platform) for item in wish_items},
+            {("wanted-book", "readmoo"), ("stale-book", "kobo")},
         )
 
     def test_add_by_title_refines_missing_fields_with_resolved_isbn(self):

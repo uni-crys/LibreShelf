@@ -35,6 +35,37 @@ python -m playwright install chromium
 
 在 `backend/.env` 設定本機用的 `GOOGLE_BOOKS_API_KEY`。這個檔案不可提交。
 
+### 本機 Readmoo 同步 agent（上傳結果到 VPS）
+
+Readmoo Cookie 一律留在 Mac；agent 不會上傳 `state.json`。它只把本機已解析的書櫃與待購資料傳到 VPS。
+
+先以 [`backend/.env.example`](../backend/.env.example) 為參考，在本機 `backend/.env` 加入：
+
+```dotenv
+READMOO_SYNC_TOKEN=<長且隨機的共享密鑰>
+READMOO_SYNC_VPS_URL=https://<你的-tailscale-serve-網址>
+```
+
+VPS backend 也必須設定相同的 `READMOO_SYNC_TOKEN` 環境變數；設定後可在容器內安全確認是否存在（只會輸出 `True` 或 `False`）：
+
+```bash
+cd /opt/libreshelf/deploy
+sudo docker compose exec backend python -c \
+'from app.config import settings; print(bool(settings.READMOO_SYNC_TOKEN))'
+```
+
+從本機執行同步。首次建議只同步書櫃，避免在 Readmoo 待購清單路徑尚未確認前改動 VPS 待購資料：
+
+```bash
+cd "/Users/crystal/VS code/Github/LibreShelf/backend"
+source ../.venv/bin/activate
+PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
+  --user-id test_user_001 \
+  --skip-wishlist
+```
+
+待購清單解析確認後，移除 `--skip-wishlist`。只有本機待購同步回傳 `success` 時，agent 才會將 Readmoo 待購 snapshot 上傳並在 VPS 執行雙向對帳；失敗時 VPS 既有待購資料會保留。
+
 ### 啟動後端
 
 開一個終端機：
