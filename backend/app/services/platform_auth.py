@@ -329,6 +329,13 @@ async def login_and_save_platform_state(
                     raise PlatformLoginBlocked(
                         "Readmoo 拒絕此登入安全驗證，請停止重試並稍後再試"
                     )
+                # Never navigate while the user is completing OAuth/login in
+                # the visible browser.  Only run the verification redirects
+                # after a fresh authenticated cookie has appeared.
+                if not await _is_logged_in(page, platform):
+                    await asyncio.sleep(1)
+                    continue
+
                 if platform == "readmoo":
                     # 1. Confirm that the storefront has consumed the login
                     # cookies, then 2. confirm that the reader subdomain can
@@ -353,29 +360,22 @@ async def login_and_save_platform_state(
                         await asyncio.sleep(1)
                         continue
 
-                elif not await _is_logged_in(page, platform):
-                    await asyncio.sleep(1)
-                    continue
-
-                if platform in {"readmoo", "kobo"}:
-                    state = await save_platform_storage_state(
-                        context,
-                        state_path,
-                        platform,
-                    )
-                    if not state.get("cookies"):
-                        raise RuntimeError("登入完成，但沒有取得可儲存的 Cookie")
-                    set_platform_session_status(user_id, platform, "active")
-                    status_recorded = True
-                    platform_label = (
-                        "Readmoo" if platform == "readmoo" else "Kobo"
-                    )
-                    return {
-                        "status": "success",
-                        "platform": platform,
-                        "cookie_count": len(state["cookies"]),
-                        "message": f"{platform_label} 登入憑證已更新",
-                    }
+                state = await save_platform_storage_state(
+                    context,
+                    state_path,
+                    platform,
+                )
+                if not state.get("cookies"):
+                    raise RuntimeError("登入完成，但沒有取得可儲存的 Cookie")
+                set_platform_session_status(user_id, platform, "active")
+                status_recorded = True
+                platform_label = "Readmoo" if platform == "readmoo" else "Kobo"
+                return {
+                    "status": "success",
+                    "platform": platform,
+                    "cookie_count": len(state["cookies"]),
+                    "message": f"{platform_label} 登入憑證已更新",
+                }
                 await asyncio.sleep(1)
 
             raise PlatformLoginTimeout(
