@@ -163,9 +163,9 @@ export default function Dashboard({ userId = 'user_01' }) {
             <Library />
           </div>
           <div className="library-hero__copy">
-            <p className="eyebrow">LIBRESHELF · 自由書閣</p>
-            <h1>藏書間</h1>
-            <p>在同一個地方，悠遊於不同的電子書平台間。</p>
+            <p className="eyebrow">LIBROVIA · 自由書閣</p>
+            <h1>藏書閣</h1>
+            <p>The way your books come together./n讓分散各處的書，循同一條路回到你的書閣。</p>
           </div>
           <div className="library-stat">
             <BookMarked aria-hidden="true" />

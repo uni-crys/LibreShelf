@@ -42,7 +42,7 @@ class ReadmooSnapshotPayload(BaseModel):
 def _require_sync_token(
     supplied_token: str | None = Header(
         default=None,
-        alias="X-LibreShelf-Sync-Token",
+        alias="X-Librovia-Sync-Token",
     ),
 ) -> None:
     expected_token = settings.READMOO_SYNC_TOKEN

@@ -1,6 +1,6 @@
-# LibreShelf・自由書閣
+# Librovia・自由書閣
 
-LibreShelf 是一套自架的個人電子書管理工具，將 Readmoo 讀墨與
+Librovia 是一套自架的個人電子書管理工具，將 Readmoo 讀墨與
 Rakuten Kobo 的已購書櫃、待購清單及書籍資訊集中在同一個介面。
 
 > 此專案仍在開發中，目前以前端內建的單一測試使用者運作，尚未提供完整的
@@ -52,8 +52,8 @@ Browser
 ### 1. 取得專案
 
 ```bash
-git clone https://github.com/uni-crys/LibreShelf.git
-cd LibreShelf
+git clone https://github.com/uni-crys/Librovia.git
+cd Librovia
 ```
 
 ### 2. 設定後端
@@ -145,7 +145,7 @@ npm run build
 ## 專案結構
 
 ```text
-LibreShelf/
+Librovia/
 ├── backend/
 │   ├── app/
 │   │   ├── api/          # FastAPI 路由
@@ -167,4 +167,3 @@ LibreShelf/
 - 請遵守 Readmoo、Kobo 與各 metadata 來源的服務條款及使用限制。
 - 請勿提交 `.env`、Cookie、Playwright storage state、資料庫或 API key。
 - 大量同步前建議先備份資料庫，並避免短時間反覆觸發平台登入。
-

@@ -142,7 +142,7 @@ function TransferDialog({
           將 {books.length} 本書移入書櫃
         </h2>
         <p>
-          請選擇實際購買平台。這只會在 LibreShelf 標記為已購，
+          請選擇實際購買平台。這只會在 Librovia 標記為已購，
           不會代替你於平台付款。
         </p>
 
@@ -345,7 +345,7 @@ export default function Wishlist({ userId }) {
           <div>
             <p className="eyebrow">WISHLIST</p>
             <h1>下一本，想讀什麼？</h1>
-            <p>以 ISBN 或完整書名加入，LibreShelf 會同步至兩個平台。</p>
+            <p>以 ISBN 或完整書名加入，Librovia 會同步至兩個平台。</p>
           </div>
           <Heart aria-hidden="true" />
         </div>

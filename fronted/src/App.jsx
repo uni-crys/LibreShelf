@@ -37,12 +37,12 @@ function App() {
         <div className="library-shell app-nav__inner">
           <a className="app-brand" href="#library">
             <Library aria-hidden="true" />
-            <span>LibreShelf・自由書閣</span>
+            <span>Librovia・自由書閣</span>
           </a>
           <div className="app-nav__links">
             <a className={page === 'library' ? 'is-active' : ''} href="#library">
               <Library />
-              藏書間
+              藏書閣
             </a>
             <a className={page === 'wishlist' ? 'is-active' : ''} href="#wishlist">
               <Heart />

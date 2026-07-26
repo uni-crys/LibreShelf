@@ -82,7 +82,7 @@ async def upload_snapshot(snapshot: dict, vps_url: str, token: str) -> dict:
         response = await client.post(
             endpoint,
             json=snapshot,
-            headers={"X-LibreShelf-Sync-Token": token},
+            headers={"X-Librovia-Sync-Token": token},
         )
         response.raise_for_status()
         return response.json()

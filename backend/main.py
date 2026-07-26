@@ -16,7 +16,7 @@ from app.services.kobo_library_worker import import_kobo_library_to_db
 from app.services.metadata_pipeline import close_metadata_client
 
 app = FastAPI(
-    title="LibreShelf API",
+    title="Librovia API",
     description="電子書與待購清單自動化管理系統",
     version="1.0.0"
 )
@@ -144,4 +144,4 @@ async def shutdown_event():
 
 @app.get("/")
 def root():
-    return {"message": "Welcome to LibreShelf API is running!"}
+    return {"message": "Welcome to Librovia API is running!"}
