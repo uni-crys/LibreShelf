@@ -4,6 +4,7 @@ from playwright.async_api import async_playwright
 from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
+from app.services.library_metadata import refresh_incomplete_book_metadata
 from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
     get_platform_auth_cookies,
@@ -44,6 +45,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
         remote_books = []
         new_books_count = 0
+        updated_books_count = 0
 
         try:
             print(
@@ -199,6 +201,16 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                         crawler_cover = b_info["cover_url"]
 
                         if isbn in existing_isbns:
+                            book = db.get(Book, isbn)
+                            if book and await refresh_incomplete_book_metadata(
+                                book,
+                                isbn=isbn,
+                                raw_title=raw_title,
+                                crawler_cover=crawler_cover,
+                                fetch_metadata=fetch_and_clean_metadata,
+                            ):
+                                db.add(book)
+                                updated_books_count += 1
                             continue
                         if (
                             effective_limit is not None
@@ -243,13 +255,17 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
                     # 集中單次 commit，避免 database is locked
                     db.commit()
-                print(f"[Readmoo Library Import] 同步完成！發現並新增了 {new_books_count} 本新書（其餘已略過）")
+                print(
+                    "[Readmoo Library Import] 同步完成！"
+                    f"新增 {new_books_count} 本，補齊 {updated_books_count} 本"
+                )
 
             return {
                 "platform": "readmoo",
                 "status": "success",
                 "message": "Readmoo 書櫃同步完成",
                 "new_books": new_books_count,
+                "updated_books": updated_books_count,
                 "remote_books": len(remote_books),
             }
         except Exception as e:
@@ -259,6 +275,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                 "status": "failed",
                 "message": str(e),
                 "new_books": new_books_count,
+                "updated_books": updated_books_count,
             }
         finally:
             await browser.close()
