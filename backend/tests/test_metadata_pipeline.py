@@ -38,6 +38,16 @@ class MetadataParsingTests(unittest.TestCase):
         self.assertEqual(clean_title_for_search("書名：完整副標【獨家附贈】"), "書名：完整副標")
         self.assertEqual(clean_title_for_search("書名（增訂二版）：副標"), "書名（增訂二版）：副標")
 
+    def test_title_normalization_tokenizes_middle_dot_and_plus(self):
+        self.assertEqual(
+            clean_title_for_search("親愛的夏吉‧班恩"),
+            "親愛的夏吉 班恩",
+        )
+        self.assertEqual(
+            clean_title_for_search("特別收錄後記＋相關事件地圖"),
+            "特別收錄後記 相關事件地圖",
+        )
+
     def test_author_normalization_removes_bilingual_alias(self):
         self.assertEqual(
             extract_clean_author("J.K.羅琳(J. K. Rowling)"),

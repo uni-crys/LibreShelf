@@ -411,6 +411,10 @@ def clean_title_for_search(title: str | None) -> str:
         return "" if re.search(marketing, match.group(0), re.I) else match.group(0)
 
     cleaned = re.sub(r"[\(\（\[【][^()（）\[\]【】]{0,50}[\)）\]】]", strip_marketing, title)
+    # Search providers are inconsistent about name separators and full-width
+    # plus signs. Treat them as token boundaries so both sides remain
+    # searchable instead of requiring an exact punctuation match.
+    cleaned = re.sub(r"[‧・·+＋]", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip(" \t-—:：")
 
 
