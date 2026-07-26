@@ -497,7 +497,10 @@ class PlatformStatusTests(unittest.TestCase):
         chromium.launch = AsyncMock(return_value="browser")
         playwright = unittest.mock.Mock(chromium=chromium)
 
-        with patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", ""):
+        with (
+            patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", ""),
+            patch.object(platform_auth, "READMOO_BROWSER_PROXY", ""),
+        ):
             browser = asyncio.run(platform_auth.launch_readmoo_browser(
                 playwright,
                 headless=False,
@@ -514,7 +517,14 @@ class PlatformStatusTests(unittest.TestCase):
         chromium.launch = AsyncMock(return_value="browser")
         playwright = unittest.mock.Mock(chromium=chromium)
 
-        with patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", "chrome"):
+        with (
+            patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", "chrome"),
+            patch.object(
+                platform_auth,
+                "READMOO_BROWSER_PROXY",
+                "socks5://readmoo-vpn:1080",
+            ),
+        ):
             asyncio.run(platform_auth.launch_readmoo_browser(
                 playwright,
                 headless=False,
@@ -524,6 +534,7 @@ class PlatformStatusTests(unittest.TestCase):
             channel="chrome",
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
+            proxy={"server": "socks5://readmoo-vpn:1080"},
         )
 
     def test_login_endpoint_returns_403_when_readmoo_is_waf_blocked(self):

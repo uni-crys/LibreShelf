@@ -21,6 +21,10 @@ READMOO_BROWSER_CHANNEL = os.getenv(
     "READMOO_BROWSER_CHANNEL",
     "",
 ).strip()
+READMOO_BROWSER_PROXY = os.getenv(
+    "READMOO_BROWSER_PROXY",
+    "",
+).strip()
 _SAFE_USER_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -40,6 +44,8 @@ async def launch_readmoo_browser(playwright, *, headless: bool):
     )
     if READMOO_BROWSER_CHANNEL:
         launch_options["channel"] = READMOO_BROWSER_CHANNEL
+    if READMOO_BROWSER_PROXY:
+        launch_options["proxy"] = {"server": READMOO_BROWSER_PROXY}
     return await playwright.chromium.launch(**launch_options)
 
 
