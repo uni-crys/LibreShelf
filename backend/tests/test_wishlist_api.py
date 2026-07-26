@@ -492,6 +492,40 @@ class PlatformStatusTests(unittest.TestCase):
             FakePage("https://www.readmoo.com/"),
         ))
 
+    def test_readmoo_uses_bundled_chromium_by_default(self):
+        chromium = unittest.mock.Mock()
+        chromium.launch = AsyncMock(return_value="browser")
+        playwright = unittest.mock.Mock(chromium=chromium)
+
+        with patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", ""):
+            browser = asyncio.run(platform_auth.launch_readmoo_browser(
+                playwright,
+                headless=False,
+            ))
+
+        self.assertEqual(browser, "browser")
+        chromium.launch.assert_awaited_once_with(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
+    def test_readmoo_can_use_installed_chrome_channel(self):
+        chromium = unittest.mock.Mock()
+        chromium.launch = AsyncMock(return_value="browser")
+        playwright = unittest.mock.Mock(chromium=chromium)
+
+        with patch.object(platform_auth, "READMOO_BROWSER_CHANNEL", "chrome"):
+            asyncio.run(platform_auth.launch_readmoo_browser(
+                playwright,
+                headless=False,
+            ))
+
+        chromium.launch.assert_awaited_once_with(
+            channel="chrome",
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
     def test_login_endpoint_returns_403_when_readmoo_is_waf_blocked(self):
         with patch.object(
             auth,

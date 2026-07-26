@@ -8,6 +8,7 @@ from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
     get_platform_auth_cookies,
     get_platform_state_path,
+    launch_readmoo_browser,
     save_platform_storage_state,
     set_platform_session_status,
 )
@@ -31,10 +32,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
         }
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=IS_HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        browser = await launch_readmoo_browser(p, headless=IS_HEADLESS)
         
         context_kwargs = {
             "viewport": {"width": 1280, "height": 800},

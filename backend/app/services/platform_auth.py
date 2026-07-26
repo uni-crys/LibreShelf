@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 SUPPORTED_PLATFORMS = {"readmoo", "kobo"}
 LOGIN_TIMEOUT_SECONDS = 180
 READMOO_LOGIN_SETTLE_SECONDS = 8
+READMOO_BROWSER_CHANNEL = os.getenv(
+    "READMOO_BROWSER_CHANNEL",
+    "",
+).strip()
 _SAFE_USER_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -25,6 +30,17 @@ class PlatformLoginTimeout(Exception):
 
 class PlatformLoginBlocked(Exception):
     pass
+
+
+async def launch_readmoo_browser(playwright, *, headless: bool):
+    """Launch bundled Chromium or an explicitly configured stable channel."""
+    launch_options = dict(
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    if READMOO_BROWSER_CHANNEL:
+        launch_options["channel"] = READMOO_BROWSER_CHANNEL
+    return await playwright.chromium.launch(**launch_options)
 
 
 def get_platform_auth_cookies(
@@ -318,10 +334,7 @@ async def login_and_save_platform_state(
     )
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        browser = await launch_readmoo_browser(playwright, headless=False)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
         )

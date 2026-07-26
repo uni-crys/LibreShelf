@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
+from app.services.platform_auth import launch_readmoo_browser
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 # 為了對應我們多使用者的路徑，您可以直接存到對應使用者的資料夾中
@@ -12,10 +13,7 @@ async def save_readmoo_state():
     
     async with async_playwright() as p:
         # 開啟瀏覽器，加上防偵測參數
-        browser = await p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        browser = await launch_readmoo_browser(p, headless=False)
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
 

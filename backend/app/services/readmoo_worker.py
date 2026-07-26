@@ -8,6 +8,7 @@ from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
 from app.services.platform_auth import (
     get_platform_auth_cookies,
+    launch_readmoo_browser,
     save_platform_storage_state,
     set_platform_session_status,
     verify_readmoo_storefront_session,
@@ -42,10 +43,7 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
             book_title = book.title
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=IS_HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        browser = await launch_readmoo_browser(p, headless=IS_HEADLESS)
         context = await browser.new_context(
             storage_state=str(state_file_path),
             viewport={"width": 1280, "height": 800}
@@ -266,10 +264,7 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
         }
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=IS_HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        browser = await launch_readmoo_browser(p, headless=IS_HEADLESS)
         context = await browser.new_context(storage_state=str(state_file_path))
         page = await context.new_page()
 
