@@ -48,6 +48,7 @@ function PlatformStatusCard({
   const isRemoteSynced = status.status === 'remote_synced';
   const healthy = ['active', 'remote_synced'].includes(status.status)
     && !status.needs_update;
+  const needsInspection = status.status === 'parser_error';
   const canRelogin = ['missing', 'invalid', 'expired', 'blocked', 'unverified']
     .includes(status.status);
 
@@ -61,7 +62,7 @@ function PlatformStatusCard({
           {healthy ? <CheckCircle2 /> : <AlertTriangle />}
           {healthy
             ? isRemoteSynced ? '本機已同步' : '連線可用'
-            : '需要更新'}
+            : needsInspection ? '需要檢查' : '需要更新'}
         </span>
       </div>
 

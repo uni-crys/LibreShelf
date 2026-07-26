@@ -33,6 +33,13 @@ python -m pip install -r backend/requirements.txt
 python -m playwright install chromium
 ```
 
+Readmoo 登入與同步預設使用 Playwright Chromium。若該機器已安裝正式版
+Google Chrome，並希望只在該機器切換瀏覽器，可在 `backend/.env` 設定：
+
+```dotenv
+READMOO_BROWSER_CHANNEL=chrome
+```
+
 在 `backend/.env` 設定本機用的 `GOOGLE_BOOKS_API_KEY`。這個檔案不可提交。
 
 ### 本機 Readmoo 同步 agent（上傳結果到 VPS）
@@ -77,7 +84,7 @@ PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
 cd "/Users/crystal/VS code/Github/LibreShelf"
 source .venv/bin/activate
 cd backend
-python -m uvicorn main:app
+python3 -m uvicorn main:app
 ```
 
 後端健康檢查：

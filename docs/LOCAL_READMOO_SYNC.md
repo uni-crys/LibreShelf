@@ -32,7 +32,7 @@ cd "/Users/crystal/VS code/Github/LibreShelf"
 source .venv/bin/activate
 
 cd backend
-python -m uvicorn main:app
+python3 -m uvicorn main:app
 ```
 
 後端保持運行。
@@ -68,7 +68,7 @@ backend/user_profiles/test_user_001/readmoo/state.json
 cd "/Users/crystal/VS code/Github/LibreShelf/backend"
 source ../.venv/bin/activate
 
-PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
+PYTHONPATH=. python3 scripts/sync_readmoo_to_vps.py \
   --user-id test_user_001 \
   --limit 3 \
   --skip-wishlist
@@ -81,7 +81,7 @@ PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
 待購清單解析已確認可用後，移除 `--skip-wishlist`：
 
 ```bash
-PYTHONPATH=. python scripts/sync_readmoo_to_vps.py \
+PYTHONPATH=. python3 scripts/sync_readmoo_to_vps.py \
   --user-id test_user_001
 ```
 
