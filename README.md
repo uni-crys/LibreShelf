@@ -141,22 +141,6 @@ cd fronted
 npm run build
 ```
 
-## 自架與遠端存取
-
-建議將 LibreShelf 部署在家用電腦、NAS 或 VPS，並透過 Tailscale、
-WireGuard 等私人網路存取。若 Readmoo 拒絕資料中心 IP，可將
-`READMOO_BROWSER_PROXY` 指向家用網路出口，讓其他服務仍維持原本路由。
-
-正式環境至少應包含：
-
-- 僅私人網路可存取的反向代理
-- `backend/data/` 與 `backend/user_profiles/` 的持久化儲存
-- 定期備份 SQLite 資料庫
-- 可供互動式登入使用的桌面或 noVNC
-- HTTPS、存取控制及安全保存的環境變數
-
-目前 API 沒有完整的使用者驗證。不要直接把 `8000` 或 noVNC
-連接埠公開到網際網路。
 
 ## 專案結構
 
@@ -184,11 +168,3 @@ LibreShelf/
 - 請勿提交 `.env`、Cookie、Playwright storage state、資料庫或 API key。
 - 大量同步前建議先備份資料庫，並避免短時間反覆觸發平台登入。
 
-## 貢獻
-
-歡迎透過 Issue 回報可重現的問題，或以 Pull Request 提交修正。提交前請：
-
-1. 確認未包含 Cookie、帳號、API key 或私人文件。
-2. 執行後端測試。
-3. 確認前端能成功建置。
-4. 清楚描述平台、操作步驟、預期結果與實際結果。
