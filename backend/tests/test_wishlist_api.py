@@ -491,6 +491,9 @@ class PlatformStatusTests(unittest.TestCase):
         self.assertTrue(platform_auth._readmoo_storefront_callback_completed(
             FakePage("https://www.readmoo.com/"),
         ))
+        self.assertTrue(platform_auth._readmoo_storefront_callback_completed(
+            FakePage("https://read.readmoo.com/#/dashboard"),
+        ))
 
     def test_readmoo_uses_bundled_chromium_by_default(self):
         chromium = unittest.mock.Mock()

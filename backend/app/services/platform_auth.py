@@ -282,9 +282,16 @@ def _readmoo_storefront_callback_completed(page) -> bool:
     parsed = urlparse(page.url)
     hostname = (parsed.hostname or "").casefold()
     callback_key = parse_qs(parsed.query).get("key", [])
+    reader_dashboard = (
+        hostname == "read.readmoo.com"
+        and parsed.fragment.casefold().startswith("/dashboard")
+    )
     return (
-        hostname in {"readmoo.com", "www.readmoo.com"}
-        and "true" not in {value.casefold() for value in callback_key}
+        reader_dashboard
+        or (
+            hostname in {"readmoo.com", "www.readmoo.com"}
+            and "true" not in {value.casefold() for value in callback_key}
+        )
     )
 
 
