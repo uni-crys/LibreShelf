@@ -267,6 +267,8 @@ STANDARD_CATEGORY_ALIASES = {
         "飲食",
         "飲食生活",
         "食譜",
+        "飲食文化",
+        "飲食文化\\札記"
     ),
     "生活風格": (
         "food, history",

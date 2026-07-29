@@ -30,9 +30,10 @@ coverage/
 playwright-report/
 test-results/
 
+# Local operations documentation
+/docs/
+
 # Editors / OS
 .DS_Store
 .vscode/
 .idea/
-
-/docs/
