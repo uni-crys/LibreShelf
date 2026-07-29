@@ -122,11 +122,22 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             # 3. 進入「書櫃」
             print(f"[Readmoo Library Import] 正在自動點擊進入「書櫃」...")
             try:
-                bookcase_tab = page.locator("a[href='#/library']").first
+                bookcase_tab = page.locator(
+                    "a[href='#/library']:visible, "
+                    "a[href*='#/library']:visible, "
+                    "a[href*='/library']:visible, "
+                    "a:has-text('書櫃'):visible, "
+                    "button:has-text('書櫃'):visible, "
+                    "[role='button']:has-text('書櫃'):visible"
+                ).first
                 if await bookcase_tab.count() > 0 and await bookcase_tab.is_visible():
                     await bookcase_tab.click()
                     print(f"[Readmoo Library Import] ✅ 已點擊書櫃，等待頁面切換...")
                 else:
+                    print(
+                        "[Readmoo Library Import] 找不到可見的書櫃入口，"
+                        f"目前 URL: {page.url}"
+                    )
                     set_platform_session_status(user_id, "readmoo", "parser_error")
                     return {
                         "platform": "readmoo",
@@ -149,6 +160,10 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                 is_readmoo_library_url,
             )
             if library_status != "ready":
+                print(
+                    "[Readmoo Library Import] 點擊後未穩定進入書櫃，"
+                    f"狀態: {library_status}，目前 URL: {page.url}"
+                )
                 status = "blocked" if library_status == "blocked" else "parser_error"
                 set_platform_session_status(user_id, "readmoo", status)
                 return {
@@ -161,12 +176,21 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             # 4. 點擊「書籍」分類
             print(f"[Readmoo Library Import] 正在自動點擊「書籍」分類...")
             try:
-                books_btn = page.locator("button:has-text('書籍'), .sc-fuztkK").first
+                books_btn = page.locator(
+                    "button:has-text('書籍'):visible, "
+                    "a:has-text('書籍'):visible, "
+                    "[role='button']:has-text('書籍'):visible, "
+                    "[role='tab']:has-text('書籍'):visible"
+                ).first
                 if await books_btn.count() > 0 and await books_btn.is_visible():
                     await books_btn.click()
                     print(f"[Readmoo Library Import] ✅ 已成功切換至「書籍」清單！")
                     await page.wait_for_timeout(2000)
                 else:
+                    print(
+                        "[Readmoo Library Import] 已進入書櫃但找不到"
+                        f"可見的「書籍」分類，目前 URL: {page.url}"
+                    )
                     set_platform_session_status(user_id, "readmoo", "parser_error")
                     return {
                         "platform": "readmoo",
