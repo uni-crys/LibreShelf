@@ -45,7 +45,7 @@ Browser
 ### 系統需求
 
 - Python 3.11 或更新版本
-- Node.js 18 或更新版本
+- Node.js 20.19 或更新版本（亦支援 Node.js 22.13+／24+）
 - npm
 - macOS、Linux，或其他 Playwright 支援的環境
 
@@ -91,7 +91,8 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 API 啟動後可開啟：
 
-- 檢查服務：<http://127.0.0.1:8000/>
+- Process liveness：<http://127.0.0.1:8000/health>
+- SQLite readiness：<http://127.0.0.1:8000/ready>
 - Swagger API 文件：<http://127.0.0.1:8000/docs>
 
 ### 3. 設定前端
@@ -138,8 +139,121 @@ python -m unittest discover -s tests
 
 ```bash
 cd fronted
+npm ci
+npm run lint
 npm run build
 ```
+
+## Production readiness
+
+### 健康檢查
+
+- `GET /health` 是 liveness probe，只表示 API process 可以回應。它不查詢外部
+  平台或資料庫，因此適合用來判斷是否需要重啟 process。
+- `GET /ready` 是 readiness probe，目前會執行 SQLite `SELECT 1`。資料庫不可用時
+  回傳 HTTP 503，可用於停止將流量導向尚未就緒的 instance。
+
+### 結構化 log
+
+後端以每行一筆 JSON 輸出 log，HTTP request 包含 `request_id`、`method`、
+`path`、`status_code` 與 `duration_ms`；同步工作另包含 `job_id`、`operation`、
+`platform`、`duration_ms` 與 `result`。若 client 傳入格式安全的
+`X-Request-ID`，回應會沿用並回傳該值，否則由伺服器產生 UUID。
+
+log 刻意不記錄 query string、request/response body、Cookie、Authorization、
+同步 token、使用者 ID 或書籍內容。新增 log 時也應維持這項界線；錯誤訊息不可
+直接帶入憑證或遠端回應全文。
+
+### CI
+
+`.github/workflows/ci.yml` 在每次 push 與 pull request 執行：
+
+- Python 3.11 安裝 pip cache 後執行後端 `unittest`
+- Node.js 24 安裝 npm cache 後執行 `npm ci`、安全稽核、ESLint 與 Vite build
+
+同一 branch/ref 的舊 CI run 會由 concurrency 設定取消，避免重複消耗資源。
+Dependabot 每週檢查 Python/npm 依賴，每月檢查 GitHub Actions。
+
+### 正式環境設定
+
+部署時將 `ENVIRONMENT=production`。後端會在啟動時要求至少 32 字元的
+`READMOO_SYNC_TOKEN`，並拒絕 wildcard、localhost 或空白的 `CORS_ORIGINS`；
+設定不安全時會 fail fast。資料庫預設固定在 `backend/data/ebooks.db`，可透過
+`LIBROVIA_DATABASE_PATH` 指定 persistent volume 上的絕對路徑。
+
+### SQLite migration 與備份
+
+API 啟動時會執行 Alembic migration，不再以 `create_all()` 取代 schema 版本管理。
+手動操作需在 API 停止或確認沒有長時間寫入工作時，於 `backend/` 執行：
+
+```bash
+# 升級至最新版 schema
+python scripts/manage_database.py migrate
+
+# 使用 SQLite online backup API 建立一致性備份，保留最近 14 份
+python scripts/manage_database.py backup \
+  --output-dir /secure/librovia-backups \
+  --keep 14
+
+# 驗證任一備份
+python scripts/manage_database.py verify \
+  /secure/librovia-backups/librovia-YYYYMMDDTHHMMSSZ.sqlite3
+
+# 還原前先停止 API；工具會先保留一份 pre-restore database
+python scripts/manage_database.py restore \
+  /secure/librovia-backups/librovia-YYYYMMDDTHHMMSSZ.sqlite3 \
+  --confirm
+```
+
+備份會先執行 `PRAGMA integrity_check`、以暫存檔原子完成並設定為 owner-only
+權限，輸出 SHA-256 供異地複製後驗證。備份目錄不可放在 Git repository，且應
+加密並定期執行實際還原演練。Alembic baseline 不提供 destructive downgrade；
+需要回退時應還原已驗證的備份。
+
+### 工作佇列評估
+
+書櫃匯入採兩階段流程：先抓完 Readmoo/Kobo 書櫃並將原始書名、封面與購買關聯
+寫入 SQLite，立即讓前端顯示；需要比對的 metadata 再寫入 `metadata_jobs`，
+由 response 後的 `BackgroundTasks` 立即喚醒處理器，APScheduler 每分鐘也會
+接手尚未完成的工作。`GET /library/metadata-status?user_id=...` 可查詢
+`pending`、`running`、`completed` 與 `failed` 數量；單筆最多嘗試三次。
+
+Readmoo 匯入器會監聽登入後閱讀器本身使用的官方書櫃 API，以平台書籍 ID 合併
+ISBN、作者、封面與分類；若 API 欄位缺漏，才以隔離、未登入的公開商品頁搜尋
+補抓。平台資料先寫入避免前端空白，但新書與原本資料不完整的書仍進入 pipeline。
+可靠資料的查找順序是國圖、Books.com.tw、Readmoo、Kobo、Open Library、
+Google Books；Kobo 候選僅在同步取得該商品資料時存在。同步紀錄不包含 cookie、
+token、書名或其他使用者內容。
+
+Kobo 書櫃列表的 UUID 僅保存為 `platform_book_id`；匯入器會以有限並行讀取商品
+頁 `.bookitem-secondary-metadata` 的「書籍ID」，驗證為 ISBN 後供 metadata
+比對與跨平台去重。Kobo 商品頁的作者與封面可作為平台原始資料；分類只採用
+`data-track-info` 明確標示為 `category` 的商品分類連結，映射為 Librovia 標準
+分類後僅補入仍未分類的書籍。平台 fallback 以 Readmoo 優先於 Kobo；Kobo
+不覆蓋已有分類，即使先同步 Kobo，後續 Readmoo 同步仍可更新成 Readmoo
+分類，而 pipeline 的較高優先序可靠結果仍可覆蓋兩者。Kobo 映射優先使用
+「企業與金融」、「小說與文學」等主分類；主分類為過度籠統的「非小說」時，
+才使用「科學與自然」、「健康與幸福」等子分類。正常同步只對缺 ISBN、作者、
+封面或分類的項目開啟商品頁；完整結果由 SQLite 的 `Book` 與 `Purchase`
+持久保存。失敗狀態、嘗試次數與下次可重試時間也會寫入 SQLite，從 24 小時
+開始 exponential backoff，三次仍不完整則標記 `manual_review`。維護時可
+明確傳入 `force_detail_refresh=True` 做全量詳情刷新。
+
+現階段 Librovia 是單機、低頻率同步，SQLite durable job table 加上 FastAPI
+`BackgroundTasks` 與 APScheduler 已足夠，暫不引入 Redis。job 本身可跨 process
+重啟保留，排程器會重新取得中斷在 `running` 的項目；但執行機制仍在 API process
+內，沒有跨 instance 鎖、完整的 timeout／取消、dead-letter queue 或獨立 worker
+隔離。CPU/記憶體密集的 Playwright 工作也會和 API 競爭資源。APScheduler 若
+同時啟動多個 API instance，可能在每個 instance 重複排程；`BackgroundTasks`
+也不適合需要嚴格保證完成或長時間執行的工作。
+
+出現下列任一情況時，應評估遷移到 Redis-backed queue（例如 RQ、Dramatiq 或
+Celery），並讓 worker 與 API 分離：
+
+- 需要水平擴充到多個 API instance，且必須避免重複同步
+- 工作在 deploy／crash 後仍須保留，或需要 retry、timeout、取消與 dead-letter
+- 同步量或排隊時間需要明確的 backpressure、優先序與營運指標
+- Playwright 工作開始影響 API latency／記憶體，或需要獨立擴縮 worker
 
 
 ## 專案結構

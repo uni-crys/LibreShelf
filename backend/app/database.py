@@ -1,13 +1,18 @@
 import os
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import event
-from sqlmodel import SQLModel, create_engine, Session
+from sqlmodel import create_engine, Session
 
-# 確保資料庫儲存目錄存在
-db_dir = "data"
-os.makedirs(db_dir, exist_ok=True)
+from app.config import BACKEND_DIR, settings
 
-sqlite_file_name = os.path.join(db_dir, "ebooks.db")
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+database_path = Path(settings.LIBROVIA_DATABASE_PATH).expanduser().resolve()
+database_path.parent.mkdir(parents=True, exist_ok=True)
+database_path.touch(mode=0o600, exist_ok=True)
+os.chmod(database_path, 0o600)
+sqlite_url = f"sqlite:///{database_path}"
 
 # 建立 DB 連線 Engine (timeout 設為 30 秒以應對頻繁寫入)
 connect_args = {"check_same_thread": False, "timeout": 30}
@@ -24,11 +29,17 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.close()
 
+def run_migrations(database_url: str = sqlite_url):
+    """Apply all committed schema migrations."""
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    config.attributes["configure_logger"] = False
+    command.upgrade(config, "head")
+
+
 def init_db():
-    """初始化資料庫並建立所有定義的資料表"""
-    # 匯入 models 確保 SQLModel 註冊所有 Table
-    from app import models
-    SQLModel.metadata.create_all(engine)
+    run_migrations()
 
 def get_session():
     """提供 FastAPI Dependency Injection 使用的 Session 產生器"""

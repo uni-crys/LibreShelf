@@ -2,42 +2,31 @@ from dotenv import load_dotenv
 load_dotenv()
 # main.py
 import asyncio
-from fastapi import FastAPI, Query
+import logging
+from fastapi import BackgroundTasks, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlmodel import SQLModel
 from contextlib import asynccontextmanager
-from app.database import engine
-from app.api import auth, books, readmoo_replication, wishlist
+from app.config import settings
+from app.database import init_db
+from app.api import auth, books, health, readmoo_replication, wishlist
 from app.services.readmoo_worker import import_readmoo_wishlist_to_db
 from app.services.readmoo_library_worker import import_readmoo_library_to_db
 from app.services.kobo_worker import import_kobo_wishlist_to_db
 from app.services.kobo_library_worker import import_kobo_library_to_db
 from app.services.metadata_pipeline import close_metadata_client
-
-app = FastAPI(
-    title="Librovia API",
-    description="電子書與待購清單自動化管理系統",
-    version="1.0.0"
+from app.services.library_import_queue import (
+    metadata_queue_status,
+    process_metadata_queue,
+)
+from app.observability import (
+    configure_logging,
+    request_logging_middleware,
+    run_sync_job,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 掛載各模組路由
-app.include_router(wishlist.router, prefix="/wishlist", tags=["Wishlist"])
-app.include_router(books.router, prefix="/books", tags=["Books"])
-app.include_router(auth.router,prefix = "/auth", tags=["Auth"])
-app.include_router(
-    readmoo_replication.router,
-    prefix="/internal",
-    tags=["Readmoo replication"],
-)
+configure_logging()
+logger = logging.getLogger("librovia.app")
 
 # 初始化背景排程器
 scheduler = BackgroundScheduler()
@@ -48,21 +37,91 @@ def scheduled_sync_job():
     由於 Worker 內的 Playwright 函式是非同步 (async) 的，
     因此需透過 asyncio.run 在同步排程中執行它們。
     """
-    print("[Scheduler] 開始執行定時自動同步任務...")
-    
-    # 預設使用者 ID，可依您的系統設計調整
-    default_user_id = "default_user" 
-    
+    default_user_id = "default_user"
+    for platform, worker in (
+        ("readmoo", import_readmoo_wishlist_to_db),
+        ("kobo", import_kobo_wishlist_to_db),
+    ):
+        try:
+            asyncio.run(run_sync_job(
+                "scheduled_wishlist_import",
+                platform,
+                worker,
+                default_user_id,
+            ))
+        except Exception:
+            # run_sync_job already emitted the exception and structured fields.
+            continue
+
+
+def scheduled_metadata_job():
+    asyncio.run(process_metadata_queue())
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    logger.info("Database migrations applied")
+
+    scheduler.add_job(
+        scheduled_sync_job,
+        "interval",
+        hours=24,
+        id="scheduled_wishlist_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        scheduled_metadata_job,
+        "interval",
+        minutes=1,
+        id="metadata_queue_processor",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    logger.info("Background scheduler started", extra={"interval_hours": 24})
     try:
-        asyncio.run(import_readmoo_wishlist_to_db(default_user_id))
-        asyncio.run(import_kobo_wishlist_to_db(default_user_id))
-        print("[Scheduler] 定時自動同步任務執行完畢。")
-    except Exception as e:
-        print(f"[Scheduler] 定時自動同步執行失敗: {e}")
+        yield
+    finally:
+        if scheduler.running:
+            scheduler.shutdown()
+        await close_metadata_client()
+        logger.info("Background scheduler stopped")
+
+
+app = FastAPI(
+    title="Librovia API",
+    description="電子書與待購清單自動化管理系統",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.middleware("http")(request_logging_middleware)
+
+# 掛載各模組路由
+app.include_router(wishlist.router, prefix="/wishlist", tags=["Wishlist"])
+app.include_router(books.router, prefix="/books", tags=["Books"])
+app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+app.include_router(
+    readmoo_replication.router,
+    prefix="/internal",
+    tags=["Readmoo replication"],
+)
+app.include_router(health.router)
+
 
 @app.post("/library/import")
 async def import_library(
     user_id: str,
+    background_tasks: BackgroundTasks = None,
     limit: int | None = Query(default=None, ge=1, le=50),
 ):
     results = []
@@ -72,18 +131,24 @@ async def import_library(
     )
     for platform, worker in workers:
         try:
-            result = await worker(user_id, limit=limit)
+            result = await run_sync_job(
+                "library_import",
+                platform,
+                worker,
+                user_id,
+                limit=limit,
+            )
             results.append(result or {
                 "platform": platform,
                 "status": "failed",
                 "message": f"{platform} 同步未回傳結果",
                 "new_books": 0,
             })
-        except Exception as error:
+        except Exception:
             results.append({
                 "platform": platform,
                 "status": "failed",
-                "message": str(error),
+                "message": f"{platform} 書櫃同步失敗，請稍後再試",
                 "new_books": 0,
             })
 
@@ -116,31 +181,30 @@ async def import_library(
         status = "success"
         message = "Readmoo 與 Kobo 已購書櫃同步完成"
 
+    metadata_jobs = sum(
+        int(result.get("metadata_jobs") or 0)
+        for result in results
+    )
+    if metadata_jobs and background_tasks is not None:
+        background_tasks.add_task(process_metadata_queue)
+
     return {
         "status": status,
         "message": message,
         "needs_auth": needs_auth,
         "results": results,
         "limit_per_platform": limit,
+        "metadata_jobs": metadata_jobs,
+        "metadata_status": (
+            "queued" if metadata_jobs else "not_needed"
+        ),
     }
 
-@app.on_event("startup")
-def startup_event():
-    SQLModel.metadata.create_all(engine)
-    print("[App] 資料庫表格初始化／驗證完成。")
 
-    """FastAPI 啟動時觸發"""
-    # 設定每 24 小時執行一次同步 (若要測試可先改為 minutes=5 或 hours=1)
-    scheduler.add_job(scheduled_sync_job, "interval", hours=24)
-    scheduler.start()
-    print("[App] 背景排程器已成功啟動 (設定週期: 24小時)")
+@app.get("/library/metadata-status")
+def get_library_metadata_status(user_id: str):
+    return metadata_queue_status(user_id)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI 關閉時觸發"""
-    scheduler.shutdown()
-    await close_metadata_client()
-    print("[App] 背景排程器已正常關閉")
 
 @app.get("/")
 def root():

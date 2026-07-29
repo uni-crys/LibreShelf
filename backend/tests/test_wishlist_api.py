@@ -1,7 +1,8 @@
 import asyncio
+import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -11,7 +12,15 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api import auth, readmoo_replication
 from app.services import platform_auth
-from app.services.kobo_library_worker import _canonical_isbn_by_platform_id
+from app.services.kobo_library_worker import (
+    _canonical_isbn_by_platform_id,
+    _kobo_detail_is_needed,
+    extract_kobo_book_id,
+    extract_kobo_detail_metadata,
+    extract_kobo_public_metadata,
+    extract_kobo_tracked_links,
+    map_kobo_category,
+)
 from app.services.library_navigation import (
     is_kobo_home_url,
     is_kobo_library_url,
@@ -26,10 +35,13 @@ from app.services.metadata_matching import (
 )
 from app.services.readmoo_library_worker import (
     _canonical_isbn_by_platform_id as readmoo_canonical_isbn_by_platform_id,
+    _merge_readmoo_api_metadata,
+    parse_readmoo_library_api,
 )
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
+    upsert_remote_wishlist_books,
 )
 from app.api.wishlist import (
     WishlistCreate,
@@ -170,6 +182,162 @@ class WishlistApiTests(unittest.TestCase):
             [{"isbn": "9789571078304", "title": "第一筆"}],
         )
 
+    def test_readmoo_library_api_extracts_and_merges_book_metadata(self):
+        payload = {
+            "included": [
+                {
+                    "type": "categories",
+                    "id": "3",
+                    "attributes": {"name": "文學小說"},
+                },
+                {
+                    "type": "books",
+                    "id": "210407586000101",
+                    "attributes": {
+                        "title": "測試書",
+                        "author": "測試作者",
+                        "isbn": "9789571078304",
+                        "cover": {
+                            "small": {"href": "https://example.test/s.jpg"},
+                            "large": {"href": "https://example.test/l.jpg"},
+                        },
+                    },
+                    "relationships": {
+                        "top_main_category": {
+                            "data": {"type": "categories", "id": "3"}
+                        }
+                    },
+                },
+            ]
+        }
+
+        metadata = parse_readmoo_library_api(payload)
+        remote_books = [{
+            "isbn": "210407586000101",
+            "title": "測試書",
+            "cover_url": None,
+        }]
+        enriched = _merge_readmoo_api_metadata(remote_books, metadata)
+
+        self.assertEqual(enriched, 1)
+        self.assertEqual(
+            remote_books[0],
+            {
+                "isbn": "210407586000101",
+                "metadata_identifier": "9789571078304",
+                "title": "測試書",
+                "platform_author": "測試作者",
+                "platform_category": "文學小說",
+                "cover_url": "https://example.test/l.jpg",
+            },
+        )
+
+    def test_remote_wishlist_filters_exact_title_already_owned(self):
+        with Session(self.engine) as session:
+            session.add(Book(
+                isbn="owned-product",
+                title="森林之神",
+                category="文學小說",
+            ))
+            session.add(Purchase(
+                user_id="reader",
+                platform="kobo",
+                platform_book_id="owned-product",
+                isbn="owned-product",
+            ))
+            session.commit()
+
+            result = upsert_remote_wishlist_books(
+                session,
+                user_id="reader",
+                platform="kobo",
+                remote_books=[{
+                    "isbn": "wishlist-product",
+                    "title": "森林之神",
+                }],
+            )
+            session.commit()
+            items = session.exec(select(WishlistItem)).all()
+
+        self.assertEqual(result["owned_filtered"], 1)
+        self.assertEqual(items, [])
+
+    def test_remote_wishlist_merges_distinctive_subtitle_across_platforms(self):
+        with Session(self.engine) as session:
+            session.add(Book(
+                isbn="readmoo-product",
+                title="變臉的緬甸",
+                category="未分類",
+            ))
+            session.add(WishlistItem(
+                user_id="reader",
+                platform="readmoo",
+                platform_book_id="readmoo-product",
+                isbn="readmoo-product",
+                sync_status="synced",
+            ))
+            session.commit()
+
+            upsert_remote_wishlist_books(
+                session,
+                user_id="reader",
+                platform="kobo",
+                remote_books=[{
+                    "isbn": "kobo-product",
+                    "title": "變臉的緬甸：一個由血、夢想和黃金構成的國度",
+                }],
+            )
+            session.commit()
+            items = session.exec(select(WishlistItem)).all()
+            books = session.exec(select(Book)).all()
+
+        self.assertEqual({item.isbn for item in items}, {"readmoo-product"})
+        self.assertEqual(
+            {
+                (item.platform, item.platform_book_id)
+                for item in items
+            },
+            {
+                ("readmoo", "readmoo-product"),
+                ("kobo", "kobo-product"),
+            },
+        )
+        self.assertEqual(len(books), 1)
+        self.assertIn("一個由血", books[0].title)
+
+    def test_short_generic_title_is_not_merged_by_prefix(self):
+        with Session(self.engine) as session:
+            session.add(Book(
+                isbn="short-product",
+                title="鯨",
+                category="未分類",
+            ))
+            session.add(WishlistItem(
+                user_id="reader",
+                platform="readmoo",
+                platform_book_id="short-product",
+                isbn="short-product",
+                sync_status="synced",
+            ))
+            session.commit()
+
+            upsert_remote_wishlist_books(
+                session,
+                user_id="reader",
+                platform="kobo",
+                remote_books=[{
+                    "isbn": "different-product",
+                    "title": "鯨：海洋紀實",
+                }],
+            )
+            session.commit()
+            items = session.exec(select(WishlistItem)).all()
+
+        self.assertEqual(
+            {item.isbn for item in items},
+            {"short-product", "different-product"},
+        )
+
     def test_missing_remote_ids_get_distinct_stable_keys(self):
         books = deduplicate_remote_books(
             [
@@ -208,6 +376,150 @@ class WishlistApiTests(unittest.TestCase):
             _canonical_isbn_by_platform_id(purchases),
             {"kobo-product-uuid": "9786263901438"},
         )
+
+    def test_kobo_book_id_parser_reads_detail_label(self):
+        self.assertEqual(
+            extract_kobo_book_id(
+                "出版者：麥浩斯\n書籍ID：9786267558935\n語言：中文"
+            ),
+            "9786267558935",
+        )
+
+    def test_kobo_book_id_parser_reads_structured_isbn(self):
+        self.assertEqual(
+            extract_kobo_book_id(
+                "",
+                ['{"@type":"Book","isbn":"9786267558935"}'],
+            ),
+            "9786267558935",
+        )
+
+    def test_kobo_book_id_parser_rejects_invalid_checksum(self):
+        self.assertIsNone(
+            extract_kobo_book_id("書籍 ID：9786267558934")
+        )
+
+    def test_kobo_detail_metadata_uses_explicit_category_not_json_genre(self):
+        metadata = extract_kobo_detail_metadata(
+            "書籍ID：9786267558935",
+            [json.dumps({
+                "@type": "Book",
+                "isbn": "9786267558935",
+                "author": [{"name": "伊恩・安德森"}],
+                "image": "https://example.test/kobo-cover.jpg",
+                "genre": "Kobo 不可信分類",
+            })],
+            ["社會科學"],
+        )
+
+        self.assertEqual(metadata["isbn"], "9786267558935")
+        self.assertEqual(metadata["author"], "伊恩・安德森")
+        self.assertEqual(
+            metadata["cover_url"],
+            "https://example.test/kobo-cover.jpg",
+        )
+        self.assertEqual(metadata["category"], "人文社科")
+
+    def test_kobo_category_prefers_store_parent_and_refines_nonfiction(self):
+        self.assertEqual(
+            map_kobo_category(["小說與文學", "心理學"]),
+            "文學小說",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "科學與自然", "科學"]),
+            "自然科普",
+        )
+        self.assertEqual(
+            map_kobo_category(["企業與金融", "經濟學"]),
+            "商業理財",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "健康與幸福", "鍛鍊"]),
+            "醫療保健",
+        )
+
+    def test_kobo_detail_refresh_skips_persisted_complete_book(self):
+        purchase = Purchase(
+            user_id="reader",
+            platform="kobo",
+            platform_book_id="product-id",
+            isbn="9789571078304",
+        )
+        complete = Book(
+            isbn="9789571078304",
+            title="完整書",
+            author="作者",
+            cover_url="https://example.test/cover.jpg",
+            category="文學小說",
+        )
+        incomplete = Book(
+            isbn="9789571078304",
+            title="缺分類",
+            author="作者",
+            cover_url="https://example.test/cover.jpg",
+            category="未分類",
+        )
+
+        self.assertFalse(_kobo_detail_is_needed(purchase, complete))
+        purchase.isbn = "unresolved-kobo-product-id"
+        self.assertTrue(_kobo_detail_is_needed(purchase, complete))
+        purchase.detail_attempts = 1
+        purchase.detail_status = "cooldown"
+        purchase.detail_next_retry_at = datetime.utcnow() + timedelta(hours=24)
+        self.assertFalse(_kobo_detail_is_needed(purchase, complete))
+        purchase.detail_next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+        self.assertTrue(_kobo_detail_is_needed(purchase, complete))
+        purchase.detail_attempts = 3
+        purchase.detail_status = "manual_review"
+        self.assertFalse(_kobo_detail_is_needed(purchase, complete))
+        purchase.detail_attempts = 0
+        purchase.detail_status = "pending"
+        purchase.detail_next_retry_at = None
+        self.assertTrue(_kobo_detail_is_needed(purchase, incomplete))
+        self.assertTrue(_kobo_detail_is_needed(None, None))
+
+    def test_kobo_tracked_links_parse_lazy_category_and_author_html(self):
+        html = """
+        <a href="/tw/zh/ebooks/literary-2"
+           data-track-info='{"description":"category","totalBooks":0}'>
+          文學
+        </a>
+        <a class="contributor-name"
+           data-track-info='{"description":"authorSearch","author":"Shuang-zi Yang"}'>
+          Shuang-zi Yang
+        </a>
+        <a href="/tw/zh/ebooks/psychology"
+           data-track-info='{"description":"category","totalBooks":0}'>
+          心理學
+        </a>
+        """
+
+        tracked = extract_kobo_tracked_links(html)
+
+        self.assertEqual(tracked["authors"], ["Shuang-zi Yang"])
+        self.assertEqual(tracked["categories"], ["文學", "心理學"])
+        self.assertEqual(map_kobo_category(["文學"]), "文學小說")
+        self.assertEqual(map_kobo_category(["心理學"]), "心理勵志")
+
+    def test_kobo_public_page_extracts_book_id_author_and_category(self):
+        html = """
+        <h1>Rewire-神經可塑性</h1>
+        <a class="contributor-name"
+           data-track-info='{"description":"authorSearch","author":"妮可．維諾拉"}'>
+          妮可．維諾拉
+        </a>
+        <a data-track-info='{"description":"category"}'>心理學</a>
+        <div class="bookitem-secondary-metadata">
+          <h2>電子書詳細資料</h2>
+          <ul><li>書籍ID：<span>9786263106635</span></li></ul>
+        </div>
+        """
+
+        metadata = extract_kobo_public_metadata(html)
+
+        self.assertEqual(metadata["isbn"], "9786263106635")
+        self.assertEqual(metadata["author"], "妮可．維諾拉")
+        self.assertEqual(metadata["category"], "心理勵志")
 
     def test_library_navigation_requires_expected_platform_route(self):
         self.assertTrue(

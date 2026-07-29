@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.database import get_session
 from app.models import Book, Purchase, WishlistItem
+from app.observability import run_sync_job
 from app.services.kobo_worker import (
     add_to_kobo_wishlist,
     import_kobo_wishlist_to_db,
@@ -201,8 +202,18 @@ async def trigger_wishlist_import(
     # launch both browser sessions at once.  The response preserves the exact
     # platform outcome so the UI never mistakes a failed login for an empty list.
     results = [
-        await import_readmoo_wishlist_to_db(user_id),
-        await import_kobo_wishlist_to_db(user_id),
+        await run_sync_job(
+            "wishlist_import",
+            "readmoo",
+            import_readmoo_wishlist_to_db,
+            user_id,
+        ),
+        await run_sync_job(
+            "wishlist_import",
+            "kobo",
+            import_kobo_wishlist_to_db,
+            user_id,
+        ),
     ]
     statuses = {result["platform"]: result["status"] for result in results}
     blocked = [
@@ -421,30 +432,45 @@ async def transfer_to_library(
         (purchase.isbn, purchase.platform.lower())
         for purchase in existing_purchases
     }
+    platform_ids = {
+        (item.isbn, item.platform.lower()): (
+            item.platform_book_id or item.isbn
+        )
+        for item in wishlist_items
+    }
     for isbn in isbns:
         for platform in platforms:
             if (isbn, platform) not in existing_keys:
                 session.add(Purchase(
                     user_id=payload.user_id,
                     platform=platform,
-                    platform_book_id=isbn,
+                    platform_book_id=platform_ids.get(
+                        (isbn, platform),
+                        isbn,
+                    ),
                     isbn=isbn,
                 ))
 
+    removals = [
+        (
+            item.platform.lower(),
+            item.platform_book_id or item.isbn,
+        )
+        for item in wishlist_items
+    ]
     for wishlist_item in wishlist_items:
         session.delete(wishlist_item)
     session.commit()
 
-    for isbn in isbns:
+    removal_workers = {
+        "readmoo": remove_from_readmoo_wishlist,
+        "kobo": remove_from_kobo_wishlist,
+    }
+    for platform, platform_book_id in removals:
         background_tasks.add_task(
-            remove_from_readmoo_wishlist,
+            removal_workers[platform],
             payload.user_id,
-            isbn,
-        )
-        background_tasks.add_task(
-            remove_from_kobo_wishlist,
-            payload.user_id,
-            isbn,
+            platform_book_id,
         )
 
     return {
@@ -470,10 +496,25 @@ async def remove_from_wishlist(
     if not existing_items:
         return {"message": "待購清單中找不到該書籍，無需移除"}
 
+    removals = [
+        (
+            item.platform.lower(),
+            item.platform_book_id or item.isbn,
+        )
+        for item in existing_items
+    ]
     for wishlist_item in existing_items:
         session.delete(wishlist_item)
     session.commit()
 
-    background_tasks.add_task(remove_from_readmoo_wishlist, user_id, isbn)
-    background_tasks.add_task(remove_from_kobo_wishlist, user_id, isbn)
+    removal_workers = {
+        "readmoo": remove_from_readmoo_wishlist,
+        "kobo": remove_from_kobo_wishlist,
+    }
+    for platform, platform_book_id in removals:
+        background_tasks.add_task(
+            removal_workers[platform],
+            user_id,
+            platform_book_id,
+        )
     return {"message": "已從待購清單移除，正在背景同步兩個平台"}

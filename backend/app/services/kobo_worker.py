@@ -10,7 +10,7 @@ from app.models import WishlistItem, Book, PlatformSession
 from app.services.platform_auth import set_platform_session_status
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
-    remove_stale_synced_wishlist_items,
+    upsert_remote_wishlist_books,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -26,7 +26,7 @@ async def _execute_kobo_wishlist_action(user_id: str, isbn: str, action: str):
     state_file_path = get_user_state_path(user_id)
     
     if not state_file_path.exists():
-        print(f"[Kobo Worker] 找不到使用者 {user_id} 的憑證檔 {state_file_path}")
+        print("[Kobo Worker] 找不到憑證檔")
         _update_sync_status(user_id, isbn, "auth_expired")
         return
 
@@ -57,14 +57,14 @@ async def _execute_kobo_wishlist_action(user_id: str, isbn: str, action: str):
         page = await context.new_page()
 
         try:
-            print(f"[Kobo Worker] 開始處理 ISBN: {isbn}，動作: {action}")
+            print(f"[Kobo Worker] 開始處理待購動作: {action}")
 
             # 1. 進入首頁檢查是否過期
             await page.goto("https://www.kobo.com/tw/zh", wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(2000)
 
             if "/signin" in page.url or await page.locator("a:has-text('登入')").locator("visible=true").count() > 0:
-                print(f"[Kobo Worker] 偵測到使用者 {user_id} 的憑證已過期！")
+                print("[Kobo Worker] 偵測到憑證已過期！")
                 _update_sync_status(user_id, isbn, "auth_expired")
                 
                 with Session(engine) as db:
@@ -166,7 +166,7 @@ def _update_sync_status(user_id: str, isbn: str, status: str):
             if item:
                 item.sync_status = status
                 db.commit()
-                print(f"[Kobo Worker] 資料庫狀態已更新為: {status} (ISBN: {isbn})")
+                print(f"[Kobo Worker] 資料庫狀態已更新為: {status}")
     except Exception as e:
         print(f"[Kobo Worker] 更新資料庫狀態失敗: {e}")
 
@@ -204,7 +204,7 @@ async def _kobo_session_is_usable(page) -> bool:
 async def import_kobo_wishlist_to_db(user_id: str) -> dict:
     state_file_path = get_user_state_path(user_id)
     if not state_file_path.exists():
-        print(f"[Kobo Import] 找不到使用者 {user_id} 的憑證檔，無法同步")
+        print("[Kobo Import] 找不到憑證檔，無法同步")
         set_platform_session_status(user_id, "kobo", "expired")
         return {
             "platform": "kobo",
@@ -306,53 +306,24 @@ async def import_kobo_wishlist_to_db(user_id: str) -> dict:
             print(f"[Kobo Import] 確認同步的 Kobo 書籍數: {len(remote_books)}")
 
             with Session(engine) as db:
-                for b_info in remote_books:
-                    isbn = b_info["isbn"]
-                    title = b_info["title"]
-
-                    book = db.get(Book, isbn)
-                    if not book:
-                        book = Book(isbn=isbn, title=title)
-                        db.add(book)
-                        db.commit()
-
-                    statement = select(WishlistItem).where(
-                        WishlistItem.user_id == user_id,
-                        WishlistItem.isbn == isbn,
-                        WishlistItem.platform == "kobo"
-                    )
-                    wish_item = db.exec(statement).first()
-
-                    if not wish_item:
-                        new_wish_item = WishlistItem(
-                            user_id=user_id,
-                            isbn=isbn,
-                            platform="kobo",
-                            sync_status="synced"
-                        )
-                        db.add(new_wish_item)
-                    else:
-                        if wish_item.sync_status != "synced":
-                            wish_item.sync_status = "synced"
-                            db.add(wish_item)
-
-                removed_count = remove_stale_synced_wishlist_items(
+                reconciliation = upsert_remote_wishlist_books(
                     db,
-                    user_id,
-                    "kobo",
-                    remote_books,
+                    user_id=user_id,
+                    platform="kobo",
+                    remote_books=remote_books,
                 )
                 db.commit()
             set_platform_session_status(user_id, "kobo", "active")
             print(
                 "[Kobo Import] 資料庫同步完成！"
-                f" 已移除 {removed_count} 筆遠端不存在的同步項目"
+                f" 已移除 {reconciliation['removed']} 筆遠端不存在的同步項目"
             )
             return {
                 "platform": "kobo",
                 "status": "success",
                 "books": len(remote_books),
-                "removed": removed_count,
+                "removed": reconciliation["removed"],
+                "owned_filtered": reconciliation["owned_filtered"],
                 "message": f"Kobo 待購清單同步完成（{len(remote_books)} 本）",
             }
 

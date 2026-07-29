@@ -15,7 +15,7 @@ from app.services.platform_auth import (
 )
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
-    remove_stale_synced_wishlist_items,
+    upsert_remote_wishlist_books,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -33,7 +33,7 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
     state_file_path = get_user_state_path(user_id)
     
     if not state_file_path.exists():
-        print(f"[Readmoo Worker] 找不到使用者 {user_id} 的憑證檔 {state_file_path}")
+        print("[Readmoo Worker] 找不到憑證檔")
         _update_sync_status(user_id, isbn, "auth_expired")
         return
 
@@ -52,7 +52,7 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
         page = await context.new_page()
 
         try:
-            print(f"[Readmoo Worker] 開始處理 ISBN: {isbn}，動作: {action}")
+            print(f"[Readmoo Worker] 開始處理待購動作: {action}")
 
             # 1. 前往首頁並檢查憑證是否過期
             await page.goto("https://readmoo.com/", wait_until="domcontentloaded", timeout=20000)
@@ -60,7 +60,7 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
 
             login_btn_count = await page.locator("a:has-text('登入'), button:has-text('登入')").locator("visible=true").count()
             if login_btn_count > 0:
-                print(f"[Readmoo Worker] 偵測到使用者 {user_id} 的憑證已過期！")
+                print("[Readmoo Worker] 偵測到憑證已過期！")
                 _update_sync_status(user_id, isbn, "auth_expired")
                 
                 with Session(engine) as db:
@@ -86,7 +86,7 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
                     print(f"[Readmoo Worker] 找不到首頁的搜尋輸入框")
                     return None
                     
-                print(f"[Readmoo Worker] 於搜尋框鍵入: {keyword}")
+                print("[Readmoo Worker] 於搜尋框鍵入查詢")
                 await search_input.click()
                 await search_input.fill("")
                 await search_input.type(keyword, delay=50)
@@ -126,11 +126,11 @@ async def _execute_readmoo_wishlist_action(user_id: str, isbn: str, action: str)
             target_url = await perform_homepage_search(isbn)
 
             if not target_url and book_title:
-                print(f"[Readmoo Worker] ISBN 無結果，切換至純書名搜尋: {book_title}")
+                print("[Readmoo Worker] ISBN 無結果，切換至純書名搜尋")
                 target_url = await perform_homepage_search(book_title.strip())
 
             if target_url:
-                print(f"[Readmoo Worker] 解析到正確書籍 URL，準備進入內頁: {target_url}")
+                print("[Readmoo Worker] 解析到書籍 URL，準備進入內頁")
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
                 
                 print(f"[Readmoo Worker] 等待內頁待購清單按鈕渲染...")
@@ -194,7 +194,7 @@ def _update_sync_status(user_id: str, isbn: str, status: str):
             if item:
                 item.sync_status = status
                 db.commit()
-                print(f"[Readmoo Worker] 資料庫狀態已更新為: {status} (ISBN: {isbn})")
+                print(f"[Readmoo Worker] 資料庫狀態已更新為: {status}")
     except Exception as e:
         print(f"[Readmoo Worker] 更新資料庫狀態失敗: {e}")
 
@@ -255,7 +255,7 @@ async def _readmoo_explicitly_empty(page) -> bool:
 async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
     state_file_path = get_user_state_path(user_id)
     if not state_file_path.exists():
-        print(f"[Readmoo Import] 找不到使用者 {user_id} 的憑證檔，無法同步")
+        print("[Readmoo Import] 找不到憑證檔，無法同步")
         set_platform_session_status(user_id, "readmoo", "expired")
         return {
             "platform": "readmoo",
@@ -380,53 +380,24 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
             print(f"[Readmoo Import] 確認同步的書籍數: {len(remote_books)}")
 
             with Session(engine) as db:
-                for b_info in remote_books:
-                    isbn = b_info["isbn"]
-                    title = b_info["title"]
-
-                    book = db.get(Book, isbn)
-                    if not book:
-                        book = Book(isbn=isbn, title=title)
-                        db.add(book)
-                        db.commit()
-
-                    statement = select(WishlistItem).where(
-                        WishlistItem.user_id == user_id,
-                        WishlistItem.isbn == isbn,
-                        WishlistItem.platform == "readmoo"
-                    )
-                    wish_item = db.exec(statement).first()
-
-                    if not wish_item:
-                        new_wish_item = WishlistItem(
-                            user_id=user_id,
-                            isbn=isbn,
-                            platform="readmoo",
-                            sync_status="synced"
-                        )
-                        db.add(new_wish_item)
-                    else:
-                        if wish_item.sync_status != "synced":
-                            wish_item.sync_status = "synced"
-                            db.add(wish_item)
-
-                removed_count = remove_stale_synced_wishlist_items(
+                reconciliation = upsert_remote_wishlist_books(
                     db,
-                    user_id,
-                    "readmoo",
-                    remote_books,
+                    user_id=user_id,
+                    platform="readmoo",
+                    remote_books=remote_books,
                 )
                 db.commit()
             set_platform_session_status(user_id, "readmoo", "active")
             print(
                 "[Readmoo Import] 資料庫同步完成！"
-                f" 已移除 {removed_count} 筆遠端不存在的同步項目"
+                f" 已移除 {reconciliation['removed']} 筆遠端不存在的同步項目"
             )
             return {
                 "platform": "readmoo",
                 "status": "success",
                 "books": len(remote_books),
-                "removed": removed_count,
+                "removed": reconciliation["removed"],
+                "owned_filtered": reconciliation["owned_filtered"],
                 "message": f"Readmoo 待購清單同步完成（{len(remote_books)} 本）",
             }
 

@@ -480,11 +480,60 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SourcePriorityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_kobo_platform_fallback_precedes_open_library_and_google(self):
+        with (
+            patch.object(
+                metadata_pipeline,
+                "get_shared_client",
+                AsyncMock(return_value=object()),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_books_com",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_readmoo_web",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_open_library",
+                AsyncMock(return_value=[]),
+            ) as open_library,
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_google_books",
+                AsyncMock(return_value=[]),
+            ) as google,
+        ):
+            result = await metadata_pipeline._lookup_metadata(
+                "kobo-product-id",
+                "平台書籍名稱",
+                None,
+                None,
+                None,
+                {
+                    "source": "kobo",
+                    "title": "平台書籍名稱",
+                    "author": "平台作者",
+                    "category": "社會科學",
+                    "cover_url": "https://example.test/kobo.jpg",
+                },
+            )
+
+        open_library.assert_not_awaited()
+        google.assert_not_awaited()
+        self.assertEqual(result["source"], "kobo")
+        self.assertEqual(result["standard_category"], "人文社科")
+
     async def test_reliable_ncl_match_stops_fallback_chain(self):
         ncl_candidate = MetadataCandidate(
             source="ncl",
             title="測試書",
             identifiers=["9789861331959"],
+            raw_categories=["文學小說"],
         )
         with (
             patch.object(
@@ -522,6 +571,65 @@ class SourcePriorityTests(unittest.IsolatedAsyncioTestCase):
         google.assert_not_awaited()
         readmoo.assert_not_awaited()
         self.assertEqual(result["source"], "ncl")
+
+    async def test_exact_ncl_without_category_continues_and_merges_readmoo(self):
+        ncl_candidate = MetadataCandidate(
+            source="ncl",
+            title="舌尖上的香料史",
+            identifiers=["9786267558935"],
+            contributors=[metadata_pipeline.Contributor("伊恩・安德森")],
+        )
+        readmoo_candidate = MetadataCandidate(
+            source="readmoo",
+            title="舌尖上的香料史",
+            identifiers=["9786267558935"],
+            raw_categories=["人文社科"],
+        )
+        with (
+            patch.object(
+                metadata_pipeline,
+                "get_shared_client",
+                AsyncMock(return_value=object()),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_ncl",
+                AsyncMock(return_value=[ncl_candidate]),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_books_com",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_readmoo_web",
+                AsyncMock(return_value=[readmoo_candidate]),
+            ) as readmoo,
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_open_library",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                metadata_pipeline,
+                "fetch_from_google_books",
+                AsyncMock(return_value=[]),
+            ) as google,
+        ):
+            result = await metadata_pipeline._lookup_metadata(
+                "9786267558935",
+                "舌尖上的香料史",
+                None,
+                None,
+                None,
+            )
+
+        readmoo.assert_awaited_once()
+        google.assert_not_awaited()
+        self.assertEqual(result["source"], "ncl")
+        self.assertEqual(result["author"], "伊恩・安德森")
+        self.assertEqual(result["category"], "人文社科")
 
     async def test_unverified_books_result_falls_through_to_open_library(self):
         books_candidate = MetadataCandidate(
@@ -635,6 +743,7 @@ class SourcePriorityTests(unittest.IsolatedAsyncioTestCase):
         readmoo_candidate = MetadataCandidate(
             source="readmoo",
             title="平台書籍名稱",
+            raw_categories=["文學小說"],
         )
         with (
             patch.object(
@@ -670,6 +779,7 @@ class SourcePriorityTests(unittest.IsolatedAsyncioTestCase):
         readmoo_candidate = MetadataCandidate(
             source="readmoo",
             title="連線失敗後仍可找到",
+            raw_categories=["文學小說"],
         )
         with (
             patch.object(

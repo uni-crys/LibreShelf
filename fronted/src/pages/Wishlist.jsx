@@ -311,7 +311,7 @@ export default function Wishlist({ userId }) {
       );
       setNotice(result.message);
       await fetchWishlist();
-    } catch (requestError) {
+    } catch {
       setError('移除失敗，請稍後再試。');
     } finally {
       setRemoving('');

@@ -1,24 +1,28 @@
 import os
+import asyncio
+import logging
 from pathlib import Path
+from difflib import SequenceMatcher
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
-from app.services.library_metadata import book_metadata_is_incomplete
+from app.services.library_import_queue import stage_library_snapshot
+from app.services.metadata_pipeline import (
+    is_valid_isbn,
+    normalize_isbn,
+    normalize_text,
+    parse_readmoo_detail,
+    parse_readmoo_search,
+    split_classification,
+)
 from app.services.library_navigation import (
     is_readmoo_dashboard_url,
     is_readmoo_library_url,
     wait_for_stable_route,
 )
 from app.services.wishlist_reconciliation import deduplicate_remote_books
-from app.services.metadata_pipeline import fetch_and_clean_metadata
-from app.services.metadata_matching import (
-    MetadataMatchAction,
-    apply_metadata_decision,
-    apply_platform_snapshot,
-    decide_metadata_match,
-    metadata_book_values,
-)
 from app.services.platform_auth import (
     get_platform_auth_cookies,
     get_platform_state_path,
@@ -29,6 +33,266 @@ from app.services.platform_auth import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "False").lower() == "true"
+LOGGER = logging.getLogger("librovia.readmoo_library")
+READMOO_DETAIL_CONCURRENCY = 2
+
+
+def _readmoo_api_cover(cover: object) -> str | None:
+    if not isinstance(cover, dict):
+        return None
+    for size in ("large", "medium", "small"):
+        value = cover.get(size)
+        if isinstance(value, dict) and value.get("href"):
+            return str(value["href"]).strip()
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def parse_readmoo_library_api(payload: object) -> dict[str, dict]:
+    """Extract non-sensitive book metadata from Readmoo's library response."""
+
+    if not isinstance(payload, dict):
+        return {}
+    included = payload.get("included")
+    if not isinstance(included, list):
+        return {}
+    resources = {
+        (str(item.get("type")), str(item.get("id"))): item
+        for item in included
+        if isinstance(item, dict) and item.get("type") and item.get("id")
+    }
+    result: dict[str, dict] = {}
+    for item in included:
+        if not isinstance(item, dict) or item.get("type") != "books":
+            continue
+        platform_id = str(item.get("id") or "").strip()
+        attributes = item.get("attributes")
+        relationships = item.get("relationships")
+        if not platform_id or not isinstance(attributes, dict):
+            continue
+        relationships = relationships if isinstance(relationships, dict) else {}
+
+        category_names = []
+        for relationship_name in ("top_main_category", "categories"):
+            relationship = relationships.get(relationship_name)
+            data = relationship.get("data") if isinstance(relationship, dict) else None
+            references = data if isinstance(data, list) else [data]
+            for reference in references:
+                if not isinstance(reference, dict):
+                    continue
+                resource = resources.get(
+                    (str(reference.get("type")), str(reference.get("id")))
+                )
+                category_attributes = (
+                    resource.get("attributes")
+                    if isinstance(resource, dict)
+                    else None
+                )
+                name = (
+                    category_attributes.get("name")
+                    if isinstance(category_attributes, dict)
+                    else None
+                )
+                if name and str(name).strip() not in category_names:
+                    category_names.append(str(name).strip())
+
+        _, _, standard_category = split_classification(category_names)
+        raw_isbn = str(attributes.get("isbn") or "").strip()
+        metadata = {
+            "title": str(attributes.get("title") or "").strip(),
+            "platform_author": str(attributes.get("author") or "").strip(),
+            "cover_url": _readmoo_api_cover(attributes.get("cover")),
+        }
+        if standard_category != "未分類":
+            metadata["platform_category"] = standard_category
+        if is_valid_isbn(raw_isbn):
+            metadata["metadata_identifier"] = normalize_isbn(raw_isbn)
+        result[platform_id] = {
+            key: value for key, value in metadata.items() if value
+        }
+    return result
+
+
+def _merge_readmoo_api_metadata(
+    remote_books: list[dict],
+    api_metadata: dict[str, dict],
+) -> int:
+    by_title = {
+        normalize_text(metadata.get("title", "")): metadata
+        for metadata in api_metadata.values()
+        if normalize_text(metadata.get("title", ""))
+    }
+    enriched = 0
+    for item in remote_books:
+        metadata = api_metadata.get(str(item.get("isbn") or "").strip())
+        if metadata is None:
+            metadata = by_title.get(normalize_text(item.get("title", "")))
+        if metadata is None:
+            continue
+        for key in (
+            "metadata_identifier",
+            "platform_author",
+            "platform_category",
+            "cover_url",
+        ):
+            if metadata.get(key):
+                item[key] = metadata[key]
+        enriched += 1
+    return enriched
+
+
+def _readmoo_items_needing_metadata(
+    user_id: str,
+    remote_books: list[dict],
+) -> list[dict]:
+    with Session(engine) as db:
+        purchases = db.exec(
+            select(Purchase).where(
+                Purchase.user_id == user_id,
+                Purchase.platform == "readmoo",
+            )
+        ).all()
+        isbn_by_platform_id = {
+            str(purchase.platform_book_id): purchase.isbn
+            for purchase in purchases
+            if purchase.platform_book_id
+        }
+        result = []
+        for item in remote_books:
+            isbn = isbn_by_platform_id.get(str(item["isbn"]))
+            book = db.get(Book, isbn) if isbn else None
+            item_has_metadata = (
+                bool(item.get("platform_author"))
+                and bool(item.get("platform_category"))
+                and bool(item.get("cover_url"))
+                and item.get("cover_url") != "/images/openbook.png"
+            )
+            if (
+                not item_has_metadata
+                and (
+                    book is None
+                    or not book.author
+                    or book.author == "未知作者"
+                    or book.category in {"未分類", "Unkown"}
+                    or not book.cover_url
+                    or book.cover_url == "/images/openbook.png"
+                )
+            ):
+                result.append(item)
+        return result
+
+
+async def enrich_readmoo_public_metadata(
+    browser,
+    remote_books: list[dict],
+) -> int:
+    """Use an isolated, unauthenticated context for public product metadata."""
+
+    if not remote_books:
+        return 0
+    public_context = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    )
+    semaphore = asyncio.Semaphore(READMOO_DETAIL_CONCURRENCY)
+    source_blocked = asyncio.Event()
+
+    async def enrich(item: dict) -> bool:
+        async with semaphore:
+            if source_blocked.is_set():
+                return False
+            page = await public_context.new_page()
+            try:
+                raw_title = str(item["title"])
+                response = await page.goto(
+                    "https://readmoo.com/search/keyword"
+                    f"?q={quote(raw_title)}&kw=&page=1",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                if response is not None and response.status == 403:
+                    source_blocked.set()
+                    LOGGER.warning(
+                        "Readmoo public metadata source blocked",
+                        extra={
+                            "platform": "readmoo",
+                            "result": "http_403",
+                        },
+                    )
+                    return False
+                candidates = parse_readmoo_search(await page.content())
+                candidate = max(
+                    candidates,
+                    key=lambda value: SequenceMatcher(
+                        None,
+                        normalize_text(raw_title),
+                        normalize_text(value.title),
+                    ).ratio(),
+                    default=None,
+                )
+                if candidate is None:
+                    return False
+                similarity = SequenceMatcher(
+                    None,
+                    normalize_text(raw_title),
+                    normalize_text(candidate.title),
+                ).ratio()
+                if similarity < 0.72 or not candidate.detail_url:
+                    return False
+                await page.goto(
+                    candidate.detail_url,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                detail = parse_readmoo_detail(await page.content())
+                contributors = detail.get("contributors") or candidate.contributors
+                author = next(
+                    (
+                        contributor.name
+                        for contributor in contributors
+                        if contributor.role == "作者"
+                    ),
+                    None,
+                )
+                categories = detail.get("raw_categories") or candidate.raw_categories
+                _, _, standard_category = split_classification(categories)
+                identifiers = detail.get("identifiers") or candidate.identifiers
+                identifier = next(
+                    (
+                        normalize_isbn(value)
+                        for value in identifiers
+                        if is_valid_isbn(value)
+                    ),
+                    None,
+                )
+                if author:
+                    item["platform_author"] = author
+                if standard_category != "未分類":
+                    item["platform_category"] = standard_category
+                if identifier:
+                    item["metadata_identifier"] = identifier
+                if candidate.cover_url:
+                    item["cover_url"] = candidate.cover_url
+                return bool(author or identifier or standard_category != "未分類")
+            except Exception:
+                LOGGER.warning(
+                    "Readmoo public detail metadata unavailable",
+                    extra={"platform": "readmoo", "result": "detail_failed"},
+                )
+                return False
+            finally:
+                await page.close()
+
+    try:
+        results = await asyncio.gather(*(enrich(item) for item in remote_books))
+        return sum(results)
+    finally:
+        await public_context.close()
 
 
 async def _first_visible(page, selectors: tuple[str, ...]):
@@ -77,6 +341,31 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
+        library_api_payloads: list[dict] = []
+        library_api_tasks: set[asyncio.Task] = set()
+
+        async def capture_library_api_response(response) -> None:
+            if (
+                "/store/v3/me/library_items" not in response.url
+                or response.status != 200
+            ):
+                return
+            try:
+                payload = await response.json()
+            except Exception:
+                return
+            if isinstance(payload, dict) and isinstance(
+                payload.get("included"),
+                list,
+            ):
+                library_api_payloads.append(payload)
+
+        def schedule_library_api_capture(response) -> None:
+            task = asyncio.create_task(capture_library_api_response(response))
+            library_api_tasks.add(task)
+            task.add_done_callback(library_api_tasks.discard)
+
+        page.on("response", schedule_library_api_capture)
 
         remote_books = []
         new_books_count = 0
@@ -134,8 +423,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                 or not auth_cookies
             ):
                 print(
-                    f"[Readmoo Library Import] 使用者 {user_id} "
-                    "的登入憑證已失效"
+                    "[Readmoo Library Import] 登入憑證已失效"
                 )
                 set_platform_session_status(user_id, "readmoo", "expired")
                 return {
@@ -312,6 +600,37 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
             # 7. 更新憑證
             if len(remote_books) > 0:
+                if library_api_tasks:
+                    await asyncio.gather(
+                        *tuple(library_api_tasks),
+                        return_exceptions=True,
+                    )
+                api_payload = max(
+                    library_api_payloads,
+                    key=lambda value: len(value.get("included", [])),
+                    default={},
+                )
+                api_metadata = parse_readmoo_library_api(api_payload)
+                api_enriched_count = _merge_readmoo_api_metadata(
+                    remote_books,
+                    api_metadata,
+                )
+                print(
+                    "[Readmoo Library Import] 官方書櫃 API metadata 合併完成，"
+                    f"取得 {api_enriched_count}/{len(remote_books)} 筆"
+                )
+                incomplete_items = _readmoo_items_needing_metadata(
+                    user_id,
+                    remote_books,
+                )
+                enriched_count = await enrich_readmoo_public_metadata(
+                    browser,
+                    incomplete_items,
+                )
+                print(
+                    "[Readmoo Library Import] 公開商品頁 metadata 解析完成，"
+                    f"取得 {enriched_count}/{len(incomplete_items)} 筆"
+                )
                 state_file_path.parent.mkdir(parents=True, exist_ok=True)
                 await save_platform_storage_state(
                     context,
@@ -322,151 +641,19 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
                 # 8. 寫入 DB (透過單一 Session 集中處理)
                 with Session(engine) as db:
-                    existing_purchases = db.exec(
-                        select(Purchase).where(
-                            Purchase.user_id == user_id,
-                            Purchase.platform == "readmoo"
-                        )
-                    ).all()
-                    existing_isbns = {
-                        purchase.isbn for purchase in existing_purchases
-                    }
-                    isbn_by_platform_id = _canonical_isbn_by_platform_id(
-                        existing_purchases
+                    staged = stage_library_snapshot(
+                        db,
+                        user_id=user_id,
+                        platform="readmoo",
+                        remote_books=remote_books,
+                        limit=effective_limit,
                     )
-
-                    for b_info in remote_books:
-                        platform_book_id = b_info["isbn"]
-                        isbn = isbn_by_platform_id.get(
-                            platform_book_id,
-                            platform_book_id,
-                        )
-                        raw_title = b_info["title"]
-                        crawler_cover = b_info["cover_url"]
-
-                        if isbn in existing_isbns:
-                            book = db.get(Book, isbn)
-                            book_changed = bool(
-                                book
-                                and apply_platform_snapshot(
-                                    book,
-                                    platform_book_id=platform_book_id,
-                                    raw_title=raw_title,
-                                    crawler_cover=crawler_cover,
-                                )
-                            )
-                            if book and book_metadata_is_incomplete(book):
-                                meta = await fetch_and_clean_metadata(
-                                    isbn=isbn,
-                                    raw_title=raw_title,
-                                )
-                                decision = decide_metadata_match(
-                                    identifier=isbn,
-                                    raw_title=raw_title,
-                                    metadata=meta,
-                                )
-                                if apply_metadata_decision(
-                                    book,
-                                    decision,
-                                    raw_title=raw_title,
-                                    crawler_cover=crawler_cover,
-                                    metadata=meta,
-                                ):
-                                    book_changed = True
-                            if book and book_changed:
-                                db.add(book)
-                                updated_books_count += 1
-                            continue
-                        if (
-                            effective_limit is not None
-                            and new_books_count >= effective_limit
-                        ):
-                            print(
-                                f"[Readmoo Library Import] 已達新書測試上限 "
-                                f"{effective_limit} 本"
-                            )
-                            break
-
-                        # 帶入 raw_title，針對 Readmoo 8 碼 ID 改以書名向博客來搜尋作者與分類
-                        meta = await fetch_and_clean_metadata(isbn=isbn, raw_title=raw_title)
-                        decision = decide_metadata_match(
-                            identifier=isbn,
-                            raw_title=raw_title,
-                            metadata=meta,
-                        )
-                        target_isbn = (
-                            decision.canonical_isbn
-                            if (
-                                decision.action
-                                == MetadataMatchAction.CANONICALIZE
-                                and decision.canonical_isbn
-                            )
-                            else isbn
-                        )
-
-                        if target_isbn in existing_isbns:
-                            purchase = next(
-                                item for item in existing_purchases
-                                if item.isbn == target_isbn
-                            )
-                            purchase.platform_book_id = platform_book_id
-                            db.add(purchase)
-                            book = db.get(Book, target_isbn)
-                            if book and apply_metadata_decision(
-                                book,
-                                decision,
-                                raw_title=raw_title,
-                                crawler_cover=crawler_cover,
-                                metadata=meta,
-                            ):
-                                db.add(book)
-                                updated_books_count += 1
-                            isbn_by_platform_id[platform_book_id] = target_isbn
-                            continue
-
-                        book = db.get(Book, target_isbn)
-                        if not book:
-                            values = metadata_book_values(
-                                decision,
-                                raw_title=raw_title,
-                                crawler_cover=crawler_cover,
-                                metadata=meta,
-                            )
-                            book = Book(
-                                isbn=target_isbn,
-                                title=str(values["title"] or raw_title),
-                                author=str(values["author"] or "未知作者"),
-                                cover_url=values["cover_url"],
-                                category=str(values["category"] or "未分類"),
-                            )
-                            db.add(book)
-                        else:
-                            apply_metadata_decision(
-                                book,
-                                decision,
-                                raw_title=raw_title,
-                                crawler_cover=crawler_cover,
-                                metadata=meta,
-                            )
-                            db.add(book)
-
-                        new_books_count += 1
-                        purchase = Purchase(
-                            user_id=user_id,
-                            platform="readmoo",
-                            platform_book_id=platform_book_id,
-                            isbn=target_isbn
-                        )
-                        db.add(purchase)
-                        existing_purchases.append(purchase)
-                        existing_isbns.add(target_isbn)
-                        isbn_by_platform_id[platform_book_id] = target_isbn
-
-                    # 集中單次 commit，避免 database is locked
-                    db.commit()
+                new_books_count = staged["new_books"]
+                updated_books_count = staged["updated_books"]
                 print(
-                    "[Readmoo Library Import] 同步完成！"
-                    f"新增 {new_books_count} 本，補齊 {updated_books_count} 本"
+                    "[Readmoo Library Import] 原始書櫃寫入完成，"
+                    f"新增 {new_books_count} 本，排入 "
+                    f"{staged['metadata_jobs']} 筆 metadata 工作"
                 )
 
             return {
@@ -476,13 +663,17 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                 "new_books": new_books_count,
                 "updated_books": updated_books_count,
                 "remote_books": len(remote_books),
+                "metadata_jobs": staged["metadata_jobs"] if remote_books else 0,
             }
-        except Exception as e:
-            print(f"[Readmoo Library Import] 同步過程發生錯誤: {e}")
+        except Exception:
+            LOGGER.exception(
+                "Readmoo library import failed",
+                extra={"platform": "readmoo", "result": "failed"},
+            )
             return {
                 "platform": "readmoo",
                 "status": "failed",
-                "message": str(e),
+                "message": "Readmoo 書櫃同步失敗，請稍後再試",
                 "new_books": new_books_count,
                 "updated_books": updated_books_count,
             }

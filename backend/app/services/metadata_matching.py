@@ -354,8 +354,9 @@ def apply_metadata_decision(
     raw_title: str,
     crawler_cover: str | None,
     metadata: dict[str, Any],
+    overwrite_with_trusted: bool = False,
 ) -> bool:
-    """Fill incomplete fields without overwriting already useful values."""
+    """Apply a match, optionally replacing lower-priority platform fallbacks."""
     before = (book.title, book.author, book.cover_url, book.category)
     values = metadata_book_values(
         decision,
@@ -365,13 +366,32 @@ def apply_metadata_decision(
     )
     if not str(book.title or "").strip() or book.title == "未知書名":
         book.title = str(values["title"] or raw_title)
-    if not str(book.author or "").strip() or book.author == "未知作者":
+    if (
+        not str(book.author or "").strip()
+        or book.author == "未知作者"
+        or (
+            overwrite_with_trusted
+            and decision.may_enrich
+            and values["author"] not in {None, "未知作者"}
+        )
+    ):
         book.author = str(values["author"] or "未知作者")
-    if not str(book.cover_url or "").strip() and values["cover_url"]:
+    if (
+        (
+            not str(book.cover_url or "").strip()
+            or (overwrite_with_trusted and decision.may_enrich)
+        )
+        and values["cover_url"]
+    ):
         book.cover_url = str(values["cover_url"])
     if (
         not str(book.category or "").strip()
         or book.category in {"未分類", "Unknown", "Unkown"}
+        or (
+            overwrite_with_trusted
+            and decision.may_enrich
+            and values["category"] not in {None, "未分類"}
+        )
     ):
         book.category = str(values["category"] or "未分類")
     return before != (book.title, book.author, book.cover_url, book.category)

@@ -307,7 +307,7 @@ async def sync_from_local(user_id: str, platform: str, db: Session = Depends(get
 
     # 1. 定義根目錄舊檔的路徑
     old_state_path = BASE_DIR / f"{platform}_state.json" # 視您的專案結構調整
-    print(f"[Debug] 正在尋找舊憑證檔，絕對路徑為: {old_state_path.resolve()}")
+    print("[Debug] 正在尋找舊憑證檔")
     # 如果舊檔和 main.py 在同一層，也可以寫成 BASE_DIR / f"{platform}_state.json"
 
     if not old_state_path.exists():

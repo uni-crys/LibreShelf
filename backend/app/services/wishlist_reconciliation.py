@@ -5,7 +5,7 @@ import re
 
 from sqlmodel import Session, select
 
-from app.models import Book, WishlistItem
+from app.models import Book, Purchase, WishlistItem
 
 _MISSING_IDENTIFIERS = {"", "none", "null", "unknown", "unknown_isbn", "undefined"}
 
@@ -16,6 +16,38 @@ def _normalized_title(value: str | None) -> str:
         character.casefold()
         for character in (value or "")
         if character.isalnum()
+    )
+
+
+def _titles_are_same_book(left: str | None, right: str | None) -> bool:
+    """Match exact titles or a distinctive title followed by a subtitle."""
+
+    left_text = (left or "").strip()
+    right_text = (right or "").strip()
+    left_normalized = _normalized_title(left_text)
+    right_normalized = _normalized_title(right_text)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+
+    shorter, longer = sorted(
+        (left_text, right_text),
+        key=lambda value: len(_normalized_title(value)),
+    )
+    if len(_normalized_title(shorter)) < 5:
+        return False
+    return any(
+        longer.startswith(f"{shorter}{separator}")
+        for separator in ("：", ":", "（", "(", " ")
+    )
+
+
+def _owned_title_matches(left: str | None, right: str | None) -> bool:
+    normalized = _normalized_title(left)
+    return (
+        len(normalized) >= 4
+        and normalized == _normalized_title(right)
     )
 
 
@@ -103,8 +135,135 @@ def remove_stale_synced_wishlist_items(
     for item in synced_items:
         book = db.get(Book, item.isbn)
         title = _normalized_title(book.title if book else "")
-        if item.isbn in remote_identifiers or (title and title in remote_titles):
+        platform_book_id = item.platform_book_id or item.isbn
+        if (
+            platform_book_id in remote_identifiers
+            or (title and title in remote_titles)
+        ):
             continue
         db.delete(item)
         removed += 1
     return removed
+
+
+def upsert_remote_wishlist_books(
+    db: Session,
+    *,
+    user_id: str,
+    platform: str,
+    remote_books: list[dict],
+) -> dict[str, int]:
+    """Upsert a platform snapshot while preserving its product identifiers."""
+
+    purchases = db.exec(
+        select(Purchase).where(Purchase.user_id == user_id)
+    ).all()
+    owned_books = {
+        purchase.isbn: db.get(Book, purchase.isbn)
+        for purchase in purchases
+    }
+    owned_platform_ids = {
+        (purchase.platform, purchase.platform_book_id)
+        for purchase in purchases
+        if purchase.platform_book_id
+    }
+    wishlist_items = db.exec(
+        select(WishlistItem).where(WishlistItem.user_id == user_id)
+    ).all()
+
+    imported = 0
+    owned_filtered = 0
+    for remote in remote_books:
+        platform_book_id = str(remote["isbn"]).strip()
+        title = str(remote["title"]).strip()
+        owned_match = (
+            (platform, platform_book_id) in owned_platform_ids
+            or any(
+                book and _owned_title_matches(book.title, title)
+                for book in owned_books.values()
+            )
+        )
+        existing_item = next(
+            (
+                item
+                for item in wishlist_items
+                if item.platform == platform
+                and (item.platform_book_id or item.isbn) == platform_book_id
+            ),
+            None,
+        )
+        if owned_match:
+            if existing_item is not None:
+                db.delete(existing_item)
+                wishlist_items.remove(existing_item)
+            owned_filtered += 1
+            continue
+
+        equivalent_item = next(
+            (
+                item
+                for item in wishlist_items
+                if item.platform != platform
+                and _titles_are_same_book(
+                    (db.get(Book, item.isbn) or Book(
+                        isbn=item.isbn,
+                        title="",
+                    )).title,
+                    title,
+                )
+            ),
+            None,
+        )
+        canonical_isbn = (
+            equivalent_item.isbn
+            if equivalent_item is not None
+            else platform_book_id
+        )
+        book = db.get(Book, canonical_isbn)
+        if book is None:
+            book = Book(isbn=canonical_isbn, title=title)
+            db.add(book)
+            db.flush()
+        elif len(title) > len(book.title):
+            book.title = title
+            db.add(book)
+
+        if existing_item is None:
+            existing_item = WishlistItem(
+                user_id=user_id,
+                isbn=canonical_isbn,
+                platform=platform,
+                platform_book_id=platform_book_id,
+                sync_status="synced",
+            )
+            wishlist_items.append(existing_item)
+        else:
+            previous_isbn = existing_item.isbn
+            existing_item.isbn = canonical_isbn
+            existing_item.platform_book_id = platform_book_id
+            existing_item.sync_status = "synced"
+            if previous_isbn != canonical_isbn:
+                previous_book = db.get(Book, previous_isbn)
+                still_used = any(
+                    item is not existing_item and item.isbn == previous_isbn
+                    for item in wishlist_items
+                ) or any(
+                    purchase.isbn == previous_isbn
+                    for purchase in purchases
+                )
+                if previous_book is not None and not still_used:
+                    db.delete(previous_book)
+        db.add(existing_item)
+        imported += 1
+
+    removed = remove_stale_synced_wishlist_items(
+        db,
+        user_id,
+        platform,
+        remote_books,
+    )
+    return {
+        "imported": imported,
+        "owned_filtered": owned_filtered,
+        "removed": removed,
+    }

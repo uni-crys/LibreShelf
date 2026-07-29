@@ -627,7 +627,13 @@ async def request_with_retry(
     attempts: int = 3,
 ) -> httpx.Response:
     last_error: Exception | None = None
-    source = urlsplit(url).netloc or url
+    parsed_url = urlsplit(url)
+    source = parsed_url.netloc or parsed_url.path
+    safe_url = (
+        f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        if parsed_url.netloc
+        else parsed_url.path
+    )
     for attempt in range(1, attempts + 1):
         try:
             response = await client.request(
@@ -647,7 +653,7 @@ async def request_with_retry(
                     extra={
                         "event": "metadata_http_failed",
                         "source": source,
-                        "url": url,
+                        "url": safe_url,
                         "status": response.status_code,
                         "attempts": attempts,
                     },
@@ -665,7 +671,7 @@ async def request_with_retry(
                 extra={
                     "event": "metadata_http_retry",
                     "source": source,
-                    "url": url,
+                    "url": safe_url,
                     "status": response.status_code,
                     "attempt": attempt,
                     "attempts": attempts,
@@ -683,7 +689,7 @@ async def request_with_retry(
                     extra={
                         "event": "metadata_transport_failed",
                         "source": source,
-                        "url": url,
+                        "url": safe_url,
                         "error": type(exc).__name__,
                         "attempts": attempts,
                     },
@@ -700,7 +706,7 @@ async def request_with_retry(
                 extra={
                     "event": "metadata_transport_retry",
                     "source": source,
-                    "url": url,
+                    "url": safe_url,
                     "error": type(exc).__name__,
                     "attempt": attempt,
                     "attempts": attempts,
@@ -1453,7 +1459,7 @@ async def fetch_from_google_books(
                 extra={
                     "event": "metadata_parse_failed",
                     "source": source,
-                    "error": str(exc),
+                    "error": type(exc).__name__,
                 },
             )
             return []
@@ -1587,7 +1593,7 @@ async def fetch_from_open_library(
             extra={
                 "event": "metadata_parse_failed",
                 "source": source,
-                "error": str(exc),
+                "error": type(exc).__name__,
             },
         )
         return []
@@ -1622,26 +1628,22 @@ async def _lookup_metadata(
     author: str | None,
     publisher: str | None,
     edition: str | None,
+    platform_fallback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     identifier = normalize_isbn(isbn)
     valid_isbn = is_valid_isbn(identifier)
     LOGGER.info(
-        "metadata_lookup_started identifier=%s isbn_valid=%s title=%s",
-        identifier,
+        "metadata_lookup_started isbn_valid=%s",
         valid_isbn,
-        (raw_title or "")[:60],
         extra={
             "event": "metadata_lookup_started",
-            "identifier": identifier,
             "isbn_valid": valid_isbn,
-            "title": (raw_title or "")[:60],
         },
     )
     if len(identifier) in {10, 13} and not valid_isbn:
         LOGGER.warning(
-            "metadata_invalid_isbn identifier=%s",
-            identifier,
-            extra={"event": "metadata_invalid_isbn", "identifier": identifier},
+            "metadata_invalid_isbn",
+            extra={"event": "metadata_invalid_isbn"},
         )
 
     client = await get_shared_client()
@@ -1650,6 +1652,40 @@ async def _lookup_metadata(
     title_query = next((query for query in queries if query != identifier), primary_query)
     candidates: list[MetadataCandidate] = []
     minimum_score = 0.58 if valid_isbn else 0.48
+
+    fallback_candidate = None
+    fallback_source = str(
+        (platform_fallback or {}).get("source") or ""
+    ).casefold()
+    if fallback_source in {"readmoo", "kobo"}:
+        fallback_author = str(
+            (platform_fallback or {}).get("author") or ""
+        ).strip()
+        fallback_category = str(
+            (platform_fallback or {}).get("category") or ""
+        ).strip()
+        fallback_candidate = MetadataCandidate(
+            source=fallback_source,
+            source_id="platform_library",
+            title=str(
+                (platform_fallback or {}).get("title")
+                or raw_title
+                or ""
+            ).strip(),
+            contributors=(
+                [Contributor(fallback_author)]
+                if fallback_author and fallback_author != "未知作者"
+                else []
+            ),
+            identifiers=[identifier] if valid_isbn else [],
+            cover_url=(platform_fallback or {}).get("cover_url"),
+            raw_categories=(
+                [fallback_category]
+                if fallback_category
+                and fallback_category not in {"未分類", "Unkown", "Unknown"}
+                else []
+            ),
+        )
 
     def has_reliable_match(
         source_name: str,
@@ -1689,6 +1725,13 @@ async def _lookup_metadata(
             }
             if not reliable:
                 reliability_reason = "isbn_unverified"
+        if (
+            reliable
+            and not best_candidate.raw_categories
+            and not best_candidate.category_codes
+        ):
+            reliable = False
+            reliability_reason = "category_missing"
         LOGGER.info(
             "metadata_source_result source=%s candidates=%s max_score=%.4f threshold=%.2f reliable=%s reason=%s",
             source_name,
@@ -1729,7 +1772,6 @@ async def _lookup_metadata(
                     "event": "metadata_source_failed",
                     "source": source_name,
                     "error": type(exc).__name__,
-                    "error_message": str(exc),
                 },
             )
             return []
@@ -1779,8 +1821,15 @@ async def _lookup_metadata(
             "readmoo",
             fetch_from_readmoo_web(client, title_query),
         )
+        if fallback_source == "readmoo" and fallback_candidate is not None:
+            readmoo_candidates.append(fallback_candidate)
         candidates.extend(readmoo_candidates)
         matched = has_reliable_match("readmoo", readmoo_candidates)
+
+    if not matched and fallback_source == "kobo" and fallback_candidate is not None:
+        kobo_candidates = [fallback_candidate]
+        candidates.extend(kobo_candidates)
+        matched = has_reliable_match("kobo", kobo_candidates)
 
     # Open Library requires no API key, so try its exact-edition ISBN endpoint
     # before spending Google Books quota.
@@ -1836,14 +1885,42 @@ async def _lookup_metadata(
 
     # A weak textual candidate is less trustworthy than the caller's own title.
     selected = best if best and best.score >= minimum_score else None
+    compatible_candidates = [
+        candidate
+        for candidate in selectable_candidates
+        if candidate.score >= minimum_score
+    ]
+    category_candidate = next(
+        (
+            candidate
+            for candidate in compatible_candidates
+            if candidate.raw_categories or candidate.category_codes
+        ),
+        selected,
+    )
     raw_categories, category_codes, standard_category = split_classification(
-        [*(selected.raw_categories if selected else []), *(selected.category_codes if selected else [])]
+        [
+            *(category_candidate.raw_categories if category_candidate else []),
+            *(category_candidate.category_codes if category_candidate else []),
+        ]
     )
     selected_author = next(
-        (person.name for person in selected.contributors if person.role == "作者"),
+        (
+            person.name
+            for candidate in compatible_candidates
+            for person in candidate.contributors
+            if person.role == "作者"
+        ),
         None,
-    ) if selected else None
-    cover_url = selected.cover_url if selected else None
+    )
+    cover_url = next(
+        (
+            candidate.cover_url
+            for candidate in compatible_candidates
+            if candidate.cover_url
+        ),
+        None,
+    )
     if cover_url and cover_url.startswith("http://"):
         cover_url = "https://" + cover_url.removeprefix("http://")
 
@@ -1879,14 +1956,12 @@ async def _lookup_metadata(
         "sources": source_summary,
     }
     LOGGER.info(
-        "metadata_lookup_completed identifier=%s source=%s confidence=%.4f candidates=%s",
-        identifier,
+        "metadata_lookup_completed source=%s confidence=%.4f candidates=%s",
         result["source"] or "none",
         result["confidence"],
         len(candidates),
         extra={
             "event": "metadata_lookup_completed",
-            "isbn": identifier,
             "candidate_count": len(candidates),
             "selected_source": result["source"],
             "confidence": result["confidence"],
@@ -1902,6 +1977,7 @@ async def fetch_and_clean_metadata(
     author: str | None = None,
     publisher: str | None = None,
     edition: str | None = None,
+    platform_fallback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fetch the best matching edition, with TTL caching and in-flight dedupe."""
     key = (
@@ -1910,14 +1986,17 @@ async def fetch_and_clean_metadata(
         normalize_text(author),
         normalize_text(publisher),
         normalize_text(edition),
+        normalize_text((platform_fallback or {}).get("source")),
+        normalize_text((platform_fallback or {}).get("author")),
+        normalize_text((platform_fallback or {}).get("category")),
+        str((platform_fallback or {}).get("cover_url") or ""),
     )
     now = time.monotonic()
     cached = _cache.get(key)
     if cached and cached[0] > now:
         LOGGER.info(
-            "metadata_cache_hit identifier=%s",
-            key[0],
-            extra={"event": "metadata_cache_hit", "identifier": key[0]},
+            "metadata_cache_hit",
+            extra={"event": "metadata_cache_hit"},
         )
         return dict(cached[1])
 
@@ -1925,7 +2004,14 @@ async def fetch_and_clean_metadata(
         task = _inflight.get(key)
         if task is None:
             task = asyncio.create_task(
-                _lookup_metadata(isbn, raw_title, author, publisher, edition)
+                _lookup_metadata(
+                    isbn,
+                    raw_title,
+                    author,
+                    publisher,
+                    edition,
+                    platform_fallback,
+                )
             )
             _inflight[key] = task
     try:

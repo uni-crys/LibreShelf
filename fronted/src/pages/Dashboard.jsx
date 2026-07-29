@@ -135,7 +135,15 @@ export default function Dashboard({ userId = 'user_01' }) {
       ) {
         setErrorMsg(result.message || '部分平台同步失敗。');
       } else {
-        setNoticeMsg(result?.message || 'Readmoo 與 Kobo 書櫃同步完成。');
+        const queued = Number(result?.metadata_jobs || 0);
+        const baseMessage = (
+          result?.message || 'Readmoo 與 Kobo 書櫃同步完成。'
+        );
+        setNoticeMsg(
+          queued > 0
+            ? `${baseMessage} 已先顯示書籍，${queued} 筆資料正在背景補齊。`
+            : baseMessage,
+        );
       }
     } catch (error) {
       console.error('同步書櫃失敗:', error);
