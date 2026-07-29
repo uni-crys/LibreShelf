@@ -20,6 +20,7 @@ from app.services.library_navigation import (
 )
 from app.services.metadata_matching import (
     MetadataMatchAction,
+    apply_platform_snapshot,
     decide_metadata_match,
     metadata_book_values,
 )
@@ -288,6 +289,82 @@ class WishlistApiTests(unittest.TestCase):
             MetadataMatchAction.ENRICH_ONLY,
         )
         self.assertIsNone(decision.canonical_isbn)
+
+    def test_metadata_decision_rejects_missing_sequel_number(self):
+        decision = decide_metadata_match(
+            identifier="14286274",
+            raw_title="也許你該找人聊聊（二版）",
+            metadata={
+                "title": "也許你該找人聊聊２（二版）",
+                "author": "蘿蕊・葛利布",
+                "confidence": 0.9,
+                "source": "google_books",
+                "identifiers": ["9786267244913"],
+            },
+        )
+
+        self.assertEqual(decision.action, MetadataMatchAction.REJECT)
+        self.assertTrue(decision.evidence.volume_conflict)
+        self.assertIn("volume_conflict", decision.reasons)
+
+    def test_metadata_decision_accepts_same_sequel_number_and_edition(self):
+        decision = decide_metadata_match(
+            identifier="readmoo-product-id",
+            raw_title="也許你該找人聊聊２",
+            raw_author="蘿蕊・葛利布",
+            metadata={
+                "title": "也許你該找人聊聊2：心理師教你大膽修訂自己的人生故事！（二版）",
+                "author": "蘿蕊・葛利布",
+                "confidence": 0.9,
+                "source": "google_books",
+                "identifiers": ["9786267244913"],
+            },
+        )
+
+        self.assertFalse(decision.evidence.volume_conflict)
+        self.assertEqual(decision.action, MetadataMatchAction.CANONICALIZE)
+
+    def test_platform_snapshot_repairs_unresolved_title_and_cover(self):
+        book = Book(
+            isbn="14286274",
+            title="也許你該找人聊聊２（二版）",
+            author="蘿蕊・葛利布",
+            cover_url="https://metadata.test/wrong.jpg",
+            category="心理勵志",
+        )
+
+        changed = apply_platform_snapshot(
+            book,
+            platform_book_id="14286274",
+            raw_title="也許你該找人聊聊（二版）",
+            crawler_cover="https://readmoo.test/original.jpg",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(book.title, "也許你該找人聊聊（二版）")
+        self.assertEqual(
+            book.cover_url,
+            "https://readmoo.test/original.jpg",
+        )
+
+    def test_platform_snapshot_does_not_overwrite_canonical_isbn(self):
+        book = Book(
+            isbn="9786267244913",
+            title="也許你該找人聊聊２（二版）",
+            author="蘿蕊・葛利布",
+            cover_url="https://metadata.test/canonical.jpg",
+            category="心理勵志",
+        )
+
+        changed = apply_platform_snapshot(
+            book,
+            platform_book_id="14286275",
+            raw_title="不可信的暫時標題",
+            crawler_cover="https://readmoo.test/raw.jpg",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(book.title, "也許你該找人聊聊２（二版）")
 
     def test_metadata_decision_canonicalizes_exact_isbn(self):
         decision = decide_metadata_match(

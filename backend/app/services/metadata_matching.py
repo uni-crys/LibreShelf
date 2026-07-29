@@ -3,7 +3,9 @@
 from dataclasses import dataclass
 from enum import Enum
 from difflib import SequenceMatcher
+import re
 from typing import Any
+import unicodedata
 
 from app.models import Book
 from app.services.metadata_pipeline import (
@@ -24,6 +26,7 @@ class MetadataMatchAction(str, Enum):
 class MetadataMatchEvidence:
     isbn_match: bool
     isbn_conflict: bool
+    volume_conflict: bool
     title_similarity: float
     author_similarity: float
     publisher_similarity: float
@@ -75,6 +78,48 @@ def _similarity(left: str | None, right: str | None) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+_EDITION_MARKER = re.compile(
+    r"[\(\[【]?\s*(?:第)?[0-9一二三四五六七八九十]+\s*版\s*[\)\]】]?",
+    re.I,
+)
+_EXPLICIT_VOLUME_MARKER = re.compile(
+    r"(?:第\s*)?([1-9]\d?|[一二三四五六七八九十]+)\s*(?:冊|集|卷|部)",
+    re.I,
+)
+_TRAILING_VOLUME_MARKER = re.compile(
+    r"(?<=[^\W\d_])([1-9]\d?|[ivx]{1,4})\s*(?=[:：]|$)",
+    re.I,
+)
+
+
+def _volume_marker(title: str | None) -> str | None:
+    """Extract a sequel/volume marker without treating 二版 as volume two."""
+    value = unicodedata.normalize("NFKC", title or "").casefold()
+    value = _EDITION_MARKER.sub("", value)
+    explicit = _EXPLICIT_VOLUME_MARKER.search(value)
+    if explicit:
+        return explicit.group(1)
+    trailing = _TRAILING_VOLUME_MARKER.search(value)
+    return trailing.group(1) if trailing else None
+
+
+def _has_volume_conflict(
+    raw_title: str,
+    metadata_title: str | None,
+    *,
+    isbn_match: bool,
+) -> bool:
+    if isbn_match:
+        return False
+    raw_volume = _volume_marker(raw_title)
+    candidate_volume = _volume_marker(metadata_title)
+    if raw_volume == candidate_volume:
+        return False
+    # Only classify this as a semantic conflict when the titles otherwise
+    # resemble one another. Unrelated titles are rejected by the normal score.
+    return _similarity(raw_title, metadata_title) >= 0.75
+
+
 def _metadata_authors(metadata: dict[str, Any]) -> str:
     contributors = metadata.get("contributors") or []
     authors = [
@@ -119,6 +164,13 @@ def decide_metadata_match(
         reasons.append("isbn_conflict")
 
     title_similarity = _similarity(raw_title, metadata.get("title"))
+    volume_conflict = _has_volume_conflict(
+        raw_title,
+        metadata.get("title"),
+        isbn_match=isbn_match,
+    )
+    if volume_conflict:
+        reasons.append("volume_conflict")
     author_similarity = _similarity(
         raw_author,
         _metadata_authors(metadata),
@@ -171,6 +223,7 @@ def decide_metadata_match(
     evidence = MetadataMatchEvidence(
         isbn_match=isbn_match,
         isbn_conflict=isbn_conflict,
+        volume_conflict=volume_conflict,
         title_similarity=round(title_similarity, 4),
         author_similarity=round(author_similarity, 4),
         publisher_similarity=round(publisher_similarity, 4),
@@ -189,6 +242,15 @@ def decide_metadata_match(
             MetadataMatchAction.REJECT,
             confidence,
             target_isbn,
+            tuple(reasons),
+            evidence,
+        )
+
+    if volume_conflict:
+        return MetadataMatchDecision(
+            MetadataMatchAction.REJECT,
+            confidence,
+            target_isbn or None,
             tuple(reasons),
             evidence,
         )
@@ -313,3 +375,33 @@ def apply_metadata_decision(
     ):
         book.category = str(values["category"] or "未分類")
     return before != (book.title, book.author, book.cover_url, book.category)
+
+
+def apply_platform_snapshot(
+    book: Book,
+    *,
+    platform_book_id: str,
+    raw_title: str,
+    crawler_cover: str | None,
+) -> bool:
+    """Repair stale metadata while a platform ID is still the local book key.
+
+    Once a platform ID has been mapped to a canonical ISBN, the canonical
+    edition remains authoritative and this function deliberately does nothing.
+    """
+    unresolved_platform_book = (
+        str(book.isbn or "").strip() == str(platform_book_id or "").strip()
+        and not is_valid_isbn(book.isbn)
+    )
+    if not unresolved_platform_book:
+        return False
+
+    before = (book.title, book.cover_url)
+    title_changed = bool(raw_title.strip()) and (
+        normalize_text(book.title) != normalize_text(raw_title)
+    )
+    if title_changed:
+        book.title = raw_title.strip()
+    if crawler_cover and (title_changed or not book.cover_url):
+        book.cover_url = crawler_cover
+    return before != (book.title, book.cover_url)

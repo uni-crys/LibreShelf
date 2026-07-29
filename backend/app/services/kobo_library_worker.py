@@ -9,6 +9,7 @@ from app.services.library_metadata import book_metadata_is_incomplete
 from app.services.metadata_matching import (
     MetadataMatchAction,
     apply_metadata_decision,
+    apply_platform_snapshot,
     decide_metadata_match,
     metadata_book_values,
 )
@@ -256,6 +257,15 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
 
                         if isbn in existing_isbns:
                             book = db.get(Book, isbn)
+                            book_changed = bool(
+                                book
+                                and apply_platform_snapshot(
+                                    book,
+                                    platform_book_id=platform_book_id,
+                                    raw_title=raw_title,
+                                    crawler_cover=crawler_cover,
+                                )
+                            )
                             if book and book_metadata_is_incomplete(book):
                                 meta = await fetch_and_clean_metadata(
                                     isbn=isbn,
@@ -273,8 +283,10 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                                     crawler_cover=crawler_cover,
                                     metadata=meta,
                                 ):
-                                    db.add(book)
-                                    updated_books_count += 1
+                                    book_changed = True
+                            if book and book_changed:
+                                db.add(book)
+                                updated_books_count += 1
                             continue
                         if (
                             effective_limit is not None
