@@ -18,6 +18,18 @@ from app.services.platform_auth import (
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "True").lower() == "true"
 
+
+def _canonical_isbn_by_platform_id(
+    purchases: list[Purchase],
+) -> dict[str, str]:
+    """Map Kobo's stable product ID to the canonical local book key."""
+    return {
+        str(purchase.platform_book_id).strip(): purchase.isbn
+        for purchase in purchases
+        if str(purchase.platform_book_id or "").strip()
+    }
+
+
 def get_user_state_path(user_id: str) -> Path:
     return get_platform_state_path(user_id, "kobo")
 
@@ -161,15 +173,25 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
 
             if len(remote_books) > 0:
                 with Session(engine) as db:
-                    existing_isbns = set(db.exec(
-                        select(Purchase.isbn).where(
+                    existing_purchases = db.exec(
+                        select(Purchase).where(
                             Purchase.user_id == user_id,
                             Purchase.platform == "kobo"
                         )
-                    ).all())
+                    ).all()
+                    existing_isbns = {
+                        purchase.isbn for purchase in existing_purchases
+                    }
+                    isbn_by_platform_id = _canonical_isbn_by_platform_id(
+                        existing_purchases
+                    )
 
                     for b_info in remote_books:
-                        isbn = b_info["isbn"]
+                        platform_book_id = b_info["isbn"]
+                        isbn = isbn_by_platform_id.get(
+                            platform_book_id,
+                            platform_book_id,
+                        )
                         raw_title = b_info["title"]
                         crawler_cover = b_info["cover_url"]
 
@@ -222,7 +244,7 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                         db.add(Purchase(
                             user_id=user_id,
                             platform="kobo",
-                            platform_book_id=isbn,
+                            platform_book_id=platform_book_id,
                             isbn=isbn
                         ))
 

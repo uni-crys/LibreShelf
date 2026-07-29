@@ -11,6 +11,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api import auth, readmoo_replication
 from app.services import platform_auth
+from app.services.kobo_library_worker import _canonical_isbn_by_platform_id
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
@@ -176,6 +177,21 @@ class WishlistApiTests(unittest.TestCase):
                 ],
                 "readmoo",
             ),
+        )
+
+    def test_kobo_platform_id_resolves_to_existing_canonical_isbn(self):
+        purchases = [
+            Purchase(
+                user_id="reader",
+                platform="kobo",
+                platform_book_id="kobo-product-uuid",
+                isbn="9786263901438",
+            ),
+        ]
+
+        self.assertEqual(
+            _canonical_isbn_by_platform_id(purchases),
+            {"kobo-product-uuid": "9786263901438"},
         )
 
     def test_local_readmoo_snapshot_upserts_without_cookie_data(self):
