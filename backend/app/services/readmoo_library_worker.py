@@ -23,6 +23,18 @@ from app.services.platform_auth import (
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 IS_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "False").lower() == "true"
 
+
+async def _first_visible(page, selectors: tuple[str, ...]):
+    """Select by semantic priority instead of document order."""
+    for selector in selectors:
+        matches = page.locator(selector)
+        for index in range(await matches.count()):
+            locator = matches.nth(index)
+            if await locator.is_visible():
+                return locator
+    return None
+
+
 def get_user_state_path(user_id: str) -> Path:
     return get_platform_state_path(user_id, "readmoo")
 
@@ -68,6 +80,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             dashboard_status = await wait_for_stable_route(
                 page,
                 is_readmoo_dashboard_url,
+                timeout_ms=180000,
             )
             if dashboard_status == "blocked":
                 set_platform_session_status(user_id, "readmoo", "blocked")
@@ -122,15 +135,32 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             # 3. 進入「書櫃」
             print(f"[Readmoo Library Import] 正在自動點擊進入「書櫃」...")
             try:
-                bookcase_tab = page.locator(
-                    "a[href='#/library']:visible, "
-                    "a[href*='#/library']:visible, "
-                    "a[href*='/library']:visible, "
-                    "a:has-text('書櫃'):visible, "
-                    "button:has-text('書櫃'):visible, "
-                    "[role='button']:has-text('書櫃'):visible"
-                ).first
-                if await bookcase_tab.count() > 0 and await bookcase_tab.is_visible():
+                bookcase_tab = await _first_visible(
+                    page,
+                    (
+                        "a[href='#/library']",
+                        "a[href='/#/library']",
+                        "a[href$='#/library']",
+                        "nav a[href*='/library']",
+                        "[role='navigation'] a[href*='/library']",
+                        "nav a:has-text('書櫃')",
+                        "[role='navigation'] a:has-text('書櫃')",
+                        "button:has-text('書櫃')",
+                    ),
+                )
+                if bookcase_tab is not None:
+                    target = await bookcase_tab.evaluate(
+                        """element => ({
+                            tag: element.tagName,
+                            href: element.getAttribute('href'),
+                            text: element.textContent.trim()
+                        })"""
+                    )
+                    print(
+                        "[Readmoo Library Import] 書櫃入口: "
+                        f"tag={target['tag']} href={target['href']} "
+                        f"text={target['text'][:30]}"
+                    )
                     await bookcase_tab.click()
                     print(f"[Readmoo Library Import] ✅ 已點擊書櫃，等待頁面切換...")
                 else:
@@ -176,13 +206,17 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             # 4. 點擊「書籍」分類
             print(f"[Readmoo Library Import] 正在自動點擊「書籍」分類...")
             try:
-                books_btn = page.locator(
-                    "button:has-text('書籍'):visible, "
-                    "a:has-text('書籍'):visible, "
-                    "[role='button']:has-text('書籍'):visible, "
-                    "[role='tab']:has-text('書籍'):visible"
-                ).first
-                if await books_btn.count() > 0 and await books_btn.is_visible():
+                books_btn = await _first_visible(
+                    page,
+                    (
+                        "[role='tab']:has-text('書籍')",
+                        "button:has-text('書籍')",
+                        "[role='button']:has-text('書籍')",
+                        "nav a:has-text('書籍')",
+                        "a:has-text('書籍')",
+                    ),
+                )
+                if books_btn is not None:
                     await books_btn.click()
                     print(f"[Readmoo Library Import] ✅ 已成功切換至「書籍」清單！")
                     await page.wait_for_timeout(2000)
