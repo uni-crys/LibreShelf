@@ -42,6 +42,7 @@ KOBO_CATEGORY_ALIASES = {
     "企業與金融": "商業理財",
     "傳記與回憶錄": "人文社科",
     "兒童": "文學小說",
+    "語言文學": "文學小說",
     "小說與文學": "文學小說",
     "愛情": "文學小說",
     "期刊": "生活風格",
@@ -63,15 +64,51 @@ KOBO_CATEGORY_ALIASES = {
     "社會與文化研究": "人文社科",
     "科學與自然": "自然科普",
     "藝術與建築": "藝術設計",
-    "電腦": "自然科普",
+    "電腦": "電腦資訊",
+}
+
+KOBO_HIERARCHICAL_CATEGORY_ALIASES = {
+    ("健康與幸福", "心理學"): "心理勵志",
+    ("健康與幸福", "自助"): "心理勵志",
+    ("健康與幸福", "健康"): "醫療保健",
+    ("健康與幸福", "醫學"): "醫療保健",
+    ("參考與語言", "法律"): "人文社科",
+    ("參考與語言", "外國語言"): "語言學習",
+    ("參考與語言", "研究輔助"): "考試用書",
 }
 
 
 def map_kobo_category(category_names: list[str] | None) -> str:
-    for category_name in category_names or []:
-        if mapped := KOBO_CATEGORY_ALIASES.get(str(category_name).strip()):
+    categories = [
+        str(category_name).strip()
+        for category_name in category_names or []
+        if str(category_name).strip()
+    ]
+    for (parent, child), mapped in KOBO_HIERARCHICAL_CATEGORY_ALIASES.items():
+        if parent in categories and child in categories:
+            if categories.index(parent) < categories.index(child):
+                return mapped
+
+    # Kobo's plain 「參考」 branch mixes unrelated subjects. Treat it as a
+    # weak signal and prefer any additional, more specific category.
+    if "參考與語言" in categories and "參考" in categories:
+        specific_categories = [
+            category
+            for category in categories
+            if category not in {"非小說", "參考與語言", "參考"}
+        ]
+        for category in specific_categories:
+            if mapped := KOBO_CATEGORY_ALIASES.get(category):
+                return mapped
+        specific_mapping = split_classification(specific_categories)[2]
+        if specific_mapping != "未分類":
+            return specific_mapping
+        return "人文社科"
+
+    for category in categories:
+        if mapped := KOBO_CATEGORY_ALIASES.get(category):
             return mapped
-    return split_classification(category_names or [])[2]
+    return split_classification(categories)[2]
 
 
 def extract_kobo_tracked_links(html: str) -> dict[str, object]:

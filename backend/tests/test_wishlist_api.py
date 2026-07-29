@@ -437,6 +437,44 @@ class WishlistApiTests(unittest.TestCase):
             map_kobo_category(["非小說", "健康與幸福", "鍛鍊"]),
             "醫療保健",
         )
+        self.assertEqual(
+            map_kobo_category(["非小說", "電腦"]),
+            "電腦資訊",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "健康與幸福", "心理學"]),
+            "心理勵志",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "健康與幸福", "自助"]),
+            "心理勵志",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "健康與幸福", "健康"]),
+            "醫療保健",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "健康與幸福", "醫學"]),
+            "醫療保健",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "參考與語言", "法律"]),
+            "人文社科",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "參考與語言", "外國語言"]),
+            "語言學習",
+        )
+        self.assertEqual(
+            map_kobo_category(["非小說", "參考與語言", "研究輔助"]),
+            "考試用書",
+        )
+        self.assertEqual(
+            map_kobo_category(
+                ["非小說", "參考與語言", "參考", "科學與自然"]
+            ),
+            "自然科普",
+        )
 
     def test_kobo_detail_refresh_skips_persisted_complete_book(self):
         purchase = Purchase(
@@ -499,6 +537,7 @@ class WishlistApiTests(unittest.TestCase):
         self.assertEqual(tracked["authors"], ["Shuang-zi Yang"])
         self.assertEqual(tracked["categories"], ["文學", "心理學"])
         self.assertEqual(map_kobo_category(["文學"]), "文學小說")
+        self.assertEqual(map_kobo_category(["語言文學"]), "文學小說")
         self.assertEqual(map_kobo_category(["心理學"]), "心理勵志")
 
     def test_kobo_public_page_extracts_book_id_author_and_category(self):
