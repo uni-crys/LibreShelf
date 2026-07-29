@@ -18,9 +18,13 @@ from app.services.library_navigation import (
     is_readmoo_dashboard_url,
     is_readmoo_library_url,
 )
+from app.services.metadata_matching import (
+    MetadataMatchAction,
+    decide_metadata_match,
+    metadata_book_values,
+)
 from app.services.readmoo_library_worker import (
     _canonical_isbn_by_platform_id as readmoo_canonical_isbn_by_platform_id,
-    _metadata_matches_platform_title,
 )
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
@@ -238,15 +242,111 @@ class WishlistApiTests(unittest.TestCase):
             {"17818597": "9786267747308"},
         )
 
-    def test_short_platform_title_cannot_expand_to_different_book(self):
-        self.assertFalse(_metadata_matches_platform_title("鯨", "鯨滅"))
-        self.assertFalse(_metadata_matches_platform_title("大橋", "大橋驟雨"))
-        self.assertTrue(
-            _metadata_matches_platform_title(
-                "Python入門教室",
-                "Python入門教室：8堂基礎課程",
-            )
+    def test_metadata_decision_rejects_short_title_expansion(self):
+        decision = decide_metadata_match(
+            identifier="17818597",
+            raw_title="鯨",
+            metadata={
+                "title": "鯨滅",
+                "author": "陳建佐",
+                "confidence": 0.7,
+                "source": "google_books",
+                "identifiers": ["9789863267386"],
+            },
         )
+
+        self.assertEqual(decision.action, MetadataMatchAction.REJECT)
+        self.assertIn("short_title_conflict", decision.reasons)
+        values = metadata_book_values(
+            decision,
+            raw_title="鯨",
+            crawler_cover="https://readmoo.test/whale.jpg",
+            metadata={"title": "鯨滅", "author": "陳建佐"},
+        )
+        self.assertEqual(values["title"], "鯨")
+        self.assertEqual(values["author"], "未知作者")
+        self.assertEqual(
+            values["cover_url"],
+            "https://readmoo.test/whale.jpg",
+        )
+
+    def test_metadata_decision_enriches_matching_long_title(self):
+        decision = decide_metadata_match(
+            identifier="7060939",
+            raw_title="Python入門教室",
+            metadata={
+                "title": "Python入門教室：8堂基礎課程",
+                "author": "大澤文孝",
+                "confidence": 0.7,
+                "source": "google_books",
+                "identifiers": ["9789864769315"],
+            },
+        )
+
+        self.assertEqual(
+            decision.action,
+            MetadataMatchAction.ENRICH_ONLY,
+        )
+        self.assertIsNone(decision.canonical_isbn)
+
+    def test_metadata_decision_canonicalizes_exact_isbn(self):
+        decision = decide_metadata_match(
+            identifier="9786267747308",
+            raw_title="鯨",
+            metadata={
+                "isbn": "9786267747308",
+                "isbn_valid": True,
+                "title": "鯨",
+                "author": "千明官",
+                "confidence": 0.87,
+                "source": "ncl",
+                "identifiers": ["9786267747308"],
+            },
+        )
+
+        self.assertEqual(
+            decision.action,
+            MetadataMatchAction.CANONICALIZE,
+        )
+        self.assertEqual(decision.canonical_isbn, "9786267747308")
+
+    def test_metadata_decision_requires_two_fields_for_new_canonical_isbn(self):
+        decision = decide_metadata_match(
+            identifier="readmoo-product-id",
+            raw_title="完整長篇書名",
+            raw_author="測試作者",
+            metadata={
+                "title": "完整長篇書名",
+                "author": "測試作者",
+                "contributors": [
+                    {"name": "測試作者", "role": "作者"},
+                ],
+                "confidence": 0.9,
+                "source": "ncl",
+                "identifiers": ["9786267747308"],
+            },
+        )
+
+        self.assertEqual(
+            decision.action,
+            MetadataMatchAction.CANONICALIZE,
+        )
+        self.assertEqual(decision.canonical_isbn, "9786267747308")
+
+    def test_metadata_decision_rejects_conflicting_isbn(self):
+        decision = decide_metadata_match(
+            identifier="9786267747308",
+            raw_title="鯨",
+            metadata={
+                "title": "另一個版本",
+                "confidence": 0.9,
+                "source": "ncl",
+                "identifiers": ["9789863267386"],
+            },
+        )
+
+        self.assertEqual(decision.action, MetadataMatchAction.REJECT)
+        self.assertTrue(decision.evidence.isbn_conflict)
 
     def test_local_readmoo_snapshot_upserts_without_cookie_data(self):
         payload = readmoo_replication.ReadmooSnapshotPayload(

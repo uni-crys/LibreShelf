@@ -5,7 +5,13 @@ from playwright.async_api import async_playwright
 from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
-from app.services.library_metadata import refresh_incomplete_book_metadata
+from app.services.library_metadata import book_metadata_is_incomplete
+from app.services.metadata_matching import (
+    MetadataMatchAction,
+    apply_metadata_decision,
+    decide_metadata_match,
+    metadata_book_values,
+)
 from app.services.library_navigation import (
     is_kobo_home_url,
     is_kobo_library_url,
@@ -250,15 +256,25 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
 
                         if isbn in existing_isbns:
                             book = db.get(Book, isbn)
-                            if book and await refresh_incomplete_book_metadata(
-                                book,
-                                isbn=isbn,
-                                raw_title=raw_title,
-                                crawler_cover=crawler_cover,
-                                fetch_metadata=fetch_and_clean_metadata,
-                            ):
-                                db.add(book)
-                                updated_books_count += 1
+                            if book and book_metadata_is_incomplete(book):
+                                meta = await fetch_and_clean_metadata(
+                                    isbn=isbn,
+                                    raw_title=raw_title,
+                                )
+                                decision = decide_metadata_match(
+                                    identifier=isbn,
+                                    raw_title=raw_title,
+                                    metadata=meta,
+                                )
+                                if apply_metadata_decision(
+                                    book,
+                                    decision,
+                                    raw_title=raw_title,
+                                    crawler_cover=crawler_cover,
+                                    metadata=meta,
+                                ):
+                                    db.add(book)
+                                    updated_books_count += 1
                             continue
                         if (
                             effective_limit is not None
@@ -270,36 +286,80 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                             )
                             break
 
-                        new_books_count += 1
-
                         # 經由 Pipeline 抓取 metadata (非真 ISBN 時以 raw_title 補齊)
                         meta = await fetch_and_clean_metadata(isbn=isbn, raw_title=raw_title)
+                        decision = decide_metadata_match(
+                            identifier=isbn,
+                            raw_title=raw_title,
+                            metadata=meta,
+                        )
+                        target_isbn = (
+                            decision.canonical_isbn
+                            if (
+                                decision.action
+                                == MetadataMatchAction.CANONICALIZE
+                                and decision.canonical_isbn
+                            )
+                            else isbn
+                        )
 
-                        book = db.get(Book, isbn)
+                        if target_isbn in existing_isbns:
+                            purchase = next(
+                                item for item in existing_purchases
+                                if item.isbn == target_isbn
+                            )
+                            purchase.platform_book_id = platform_book_id
+                            db.add(purchase)
+                            book = db.get(Book, target_isbn)
+                            if book and apply_metadata_decision(
+                                book,
+                                decision,
+                                raw_title=raw_title,
+                                crawler_cover=crawler_cover,
+                                metadata=meta,
+                            ):
+                                db.add(book)
+                                updated_books_count += 1
+                            isbn_by_platform_id[platform_book_id] = target_isbn
+                            continue
+
+                        book = db.get(Book, target_isbn)
                         if not book:
+                            values = metadata_book_values(
+                                decision,
+                                raw_title=raw_title,
+                                crawler_cover=crawler_cover,
+                                metadata=meta,
+                            )
                             book = Book(
-                                isbn=isbn,
-                                title=meta.get("title") or raw_title,
-                                author=meta.get("author") or "未知作者",
-                                cover_url=meta.get("cover_url") or crawler_cover,
-                                category=meta.get("category") or "未分類"
+                                isbn=target_isbn,
+                                title=str(values["title"] or raw_title),
+                                author=str(values["author"] or "未知作者"),
+                                cover_url=values["cover_url"],
+                                category=str(values["category"] or "未分類"),
                             )
                             db.add(book)
                         else:
-                            if book.author == "未知作者" or not book.author:
-                                book.author = meta.get("author") or "未知作者"
-                            if book.category == "未分類" or not book.category:
-                                book.category = meta.get("category") or "未分類"
-                            if not book.cover_url and crawler_cover:
-                                book.cover_url = crawler_cover
+                            apply_metadata_decision(
+                                book,
+                                decision,
+                                raw_title=raw_title,
+                                crawler_cover=crawler_cover,
+                                metadata=meta,
+                            )
                             db.add(book)
 
-                        db.add(Purchase(
+                        new_books_count += 1
+                        purchase = Purchase(
                             user_id=user_id,
                             platform="kobo",
                             platform_book_id=platform_book_id,
-                            isbn=isbn
-                        ))
+                            isbn=target_isbn
+                        )
+                        db.add(purchase)
+                        existing_purchases.append(purchase)
+                        existing_isbns.add(target_isbn)
+                        isbn_by_platform_id[platform_book_id] = target_isbn
 
                     # 集中單次 commit，避免鎖檔
                     db.commit()
