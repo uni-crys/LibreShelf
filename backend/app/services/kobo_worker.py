@@ -9,6 +9,7 @@ from app.database import engine
 from app.models import WishlistItem, Book, PlatformSession
 from app.services.platform_auth import set_platform_session_status
 from app.services.wishlist_reconciliation import (
+    deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
 )
 
@@ -301,6 +302,7 @@ async def import_kobo_wishlist_to_db(user_id: str) -> dict:
                     "message": "Kobo 頁面沒有可辨識的待購清單資料",
                 }
 
+            remote_books = deduplicate_remote_books(remote_books, "kobo")
             print(f"[Kobo Import] 確認同步的 Kobo 書籍數: {len(remote_books)}")
 
             with Session(engine) as db:

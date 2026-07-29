@@ -5,6 +5,7 @@ from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
 from app.services.library_metadata import refresh_incomplete_book_metadata
+from app.services.wishlist_reconciliation import deduplicate_remote_books
 from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
     get_platform_auth_cookies,
@@ -162,18 +163,18 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                     if await privacy_div.count() > 0:
                         privacy_id = await privacy_div.get_attribute("id")
 
-                    isbn = privacy_id.replace("privacy-", "") if privacy_id else (href.split("/")[-1] if href else f"rm_lib_{abs(hash(title))}")
+                    isbn = privacy_id.replace("privacy-", "") if privacy_id else (href.split("/")[-1] if href else "")
 
                     if title and title.strip():
-                        if not any(b["isbn"] == str(isbn).strip() for b in remote_books):
-                            remote_books.append({
-                                "isbn": str(isbn).strip(),
-                                "title": title.strip(),
-                                "cover_url": cover_url.strip() if cover_url else None
-                            })
+                        remote_books.append({
+                            "isbn": str(isbn).strip(),
+                            "title": title.strip(),
+                            "cover_url": cover_url.strip() if cover_url else None
+                        })
                 except Exception as e:
                     print(f"[Readmoo Library Import] 解析第 {i} 本書失敗: {e}")
 
+            remote_books = deduplicate_remote_books(remote_books, "readmoo")
             print(f"[Readmoo Library Import] 成功解析 {len(remote_books)} 本已購書籍")
 
             # 7. 更新憑證

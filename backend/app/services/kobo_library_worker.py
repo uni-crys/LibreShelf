@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
 from app.services.library_metadata import refresh_incomplete_book_metadata
+from app.services.wishlist_reconciliation import deduplicate_remote_books
 from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
     get_platform_auth_cookies,
@@ -129,15 +130,14 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                         
                         if product_id == "UNKNOWN_ID":
                             href = await title_el.get_attribute("href") if await title_el.count() > 0 else ""
-                            product_id = href.split("/")[-1] if href else f"kobo_lib_{abs(hash(title))}"
+                            product_id = href.split("/")[-1] if href else ""
 
                         if title and title.strip():
-                            if not any(b["isbn"] == str(product_id).strip() for b in remote_books):
-                                remote_books.append({
-                                    "isbn": str(product_id).strip(),
-                                    "title": title.strip(),
-                                    "cover_url": cover_url.strip() if cover_url else None
-                                })
+                            remote_books.append({
+                                "isbn": str(product_id).strip(),
+                                "title": title.strip(),
+                                "cover_url": cover_url.strip() if cover_url else None
+                            })
                     except Exception as e:
                         print(f"[Kobo Library Import] 解析書籍失敗: {e}")
 
@@ -156,6 +156,7 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                     print(f"[Kobo Library Import] 沒有找到下一頁按鈕，爬取結束。")
                     break
 
+            remote_books = deduplicate_remote_books(remote_books, "kobo")
             print(f"[Kobo Library Import] 總共成功解析 {len(remote_books)} 本已購書籍")
 
             if len(remote_books) > 0:

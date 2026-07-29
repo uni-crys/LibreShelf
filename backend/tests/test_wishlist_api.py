@@ -12,6 +12,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.api import auth, readmoo_replication
 from app.services import platform_auth
 from app.services.wishlist_reconciliation import (
+    deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
 )
 from app.api.wishlist import (
@@ -137,6 +138,44 @@ class WishlistApiTests(unittest.TestCase):
         self.assertEqual(
             {(item.isbn, item.platform) for item in items},
             {("keep", "kobo"), ("pending", "kobo"), ("gone", "readmoo")},
+        )
+
+    def test_remote_import_deduplicates_equivalent_isbn_formats(self):
+        books = deduplicate_remote_books(
+            [
+                {"isbn": "978-957-10-7830-4", "title": "第一筆"},
+                {"isbn": " 9789571078304 ", "title": "重複資料"},
+            ],
+            "kobo",
+        )
+
+        self.assertEqual(
+            books,
+            [{"isbn": "9789571078304", "title": "第一筆"}],
+        )
+
+    def test_missing_remote_ids_get_distinct_stable_keys(self):
+        books = deduplicate_remote_books(
+            [
+                {"isbn": "UNKNOWN_ISBN", "title": "甲書"},
+                {"isbn": None, "title": "乙書"},
+                {"isbn": "", "title": " 甲書 "},
+            ],
+            "readmoo",
+        )
+
+        self.assertEqual(len(books), 2)
+        self.assertNotEqual(books[0]["isbn"], books[1]["isbn"])
+        self.assertTrue(books[0]["isbn"].startswith("readmoo:title:"))
+        self.assertEqual(
+            books,
+            deduplicate_remote_books(
+                [
+                    {"isbn": None, "title": "甲書"},
+                    {"isbn": "UNKNOWN_ISBN", "title": "乙書"},
+                ],
+                "readmoo",
+            ),
         )
 
     def test_local_readmoo_snapshot_upserts_without_cookie_data(self):

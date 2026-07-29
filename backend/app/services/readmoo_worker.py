@@ -14,6 +14,7 @@ from app.services.platform_auth import (
     verify_readmoo_storefront_session,
 )
 from app.services.wishlist_reconciliation import (
+    deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
 )
 
@@ -375,6 +376,7 @@ async def import_readmoo_wishlist_to_db(user_id: str) -> dict:
                 if title and title.strip():
                     remote_books.append({"isbn": str(isbn).strip(), "title": title.strip()})
 
+            remote_books = deduplicate_remote_books(remote_books, "readmoo")
             print(f"[Readmoo Import] 確認同步的書籍數: {len(remote_books)}")
 
             with Session(engine) as db:
