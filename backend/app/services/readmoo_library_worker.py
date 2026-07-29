@@ -11,7 +11,11 @@ from app.services.library_navigation import (
     wait_for_stable_route,
 )
 from app.services.wishlist_reconciliation import deduplicate_remote_books
-from app.services.metadata_pipeline import fetch_and_clean_metadata
+from app.services.metadata_pipeline import (
+    fetch_and_clean_metadata,
+    is_valid_isbn,
+    normalize_text,
+)
 from app.services.platform_auth import (
     get_platform_auth_cookies,
     get_platform_state_path,
@@ -33,6 +37,30 @@ async def _first_visible(page, selectors: tuple[str, ...]):
             if await locator.is_visible():
                 return locator
     return None
+
+
+def _canonical_isbn_by_platform_id(
+    purchases: list[Purchase],
+) -> dict[str, str]:
+    return {
+        str(purchase.platform_book_id).strip(): purchase.isbn
+        for purchase in purchases
+        if str(purchase.platform_book_id or "").strip()
+    }
+
+
+def _metadata_matches_platform_title(
+    raw_title: str,
+    metadata_title: str | None,
+) -> bool:
+    """Reject ambiguous expansion such as 鯨 -> 鯨滅 or 大橋 -> 大橋驟雨."""
+    raw = normalize_text(raw_title)
+    candidate = normalize_text(metadata_title)
+    if not raw or not candidate:
+        return False
+    if raw == candidate:
+        return True
+    return len(raw) >= 4 and (raw in candidate or candidate in raw)
 
 
 def get_user_state_path(user_id: str) -> Path:
@@ -305,15 +333,25 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
                 # 8. 寫入 DB (透過單一 Session 集中處理)
                 with Session(engine) as db:
-                    existing_isbns = set(db.exec(
-                        select(Purchase.isbn).where(
+                    existing_purchases = db.exec(
+                        select(Purchase).where(
                             Purchase.user_id == user_id,
                             Purchase.platform == "readmoo"
                         )
-                    ).all())
+                    ).all()
+                    existing_isbns = {
+                        purchase.isbn for purchase in existing_purchases
+                    }
+                    isbn_by_platform_id = _canonical_isbn_by_platform_id(
+                        existing_purchases
+                    )
 
                     for b_info in remote_books:
-                        isbn = b_info["isbn"]
+                        platform_book_id = b_info["isbn"]
+                        isbn = isbn_by_platform_id.get(
+                            platform_book_id,
+                            platform_book_id,
+                        )
                         raw_title = b_info["title"]
                         crawler_cover = b_info["cover_url"]
 
@@ -343,15 +381,38 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
                         # 帶入 raw_title，針對 Readmoo 8 碼 ID 改以書名向博客來搜尋作者與分類
                         meta = await fetch_and_clean_metadata(isbn=isbn, raw_title=raw_title)
+                        metadata_reliable = (
+                            is_valid_isbn(isbn)
+                            or _metadata_matches_platform_title(
+                                raw_title,
+                                meta.get("title"),
+                            )
+                        )
 
                         book = db.get(Book, isbn)
                         if not book:
                             book = Book(
                                 isbn=isbn,
-                                title=meta.get("title") or raw_title,
-                                author=meta.get("author") or "未知作者",
-                                cover_url=meta.get("cover_url") or crawler_cover,
-                                category=meta.get("category") or "未分類"
+                                title=(
+                                    meta.get("title")
+                                    if metadata_reliable
+                                    else raw_title
+                                ) or raw_title,
+                                author=(
+                                    meta.get("author")
+                                    if metadata_reliable
+                                    else None
+                                ) or "未知作者",
+                                cover_url=(
+                                    meta.get("cover_url")
+                                    if metadata_reliable
+                                    else crawler_cover
+                                ) or crawler_cover,
+                                category=(
+                                    meta.get("category")
+                                    if metadata_reliable
+                                    else None
+                                ) or "未分類"
                             )
                             db.add(book)
                         else:
@@ -366,7 +427,7 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                         db.add(Purchase(
                             user_id=user_id,
                             platform="readmoo",
-                            platform_book_id=isbn,
+                            platform_book_id=platform_book_id,
                             isbn=isbn
                         ))
 

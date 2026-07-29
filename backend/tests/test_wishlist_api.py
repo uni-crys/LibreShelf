@@ -18,6 +18,10 @@ from app.services.library_navigation import (
     is_readmoo_dashboard_url,
     is_readmoo_library_url,
 )
+from app.services.readmoo_library_worker import (
+    _canonical_isbn_by_platform_id as readmoo_canonical_isbn_by_platform_id,
+    _metadata_matches_platform_title,
+)
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
@@ -216,6 +220,31 @@ class WishlistApiTests(unittest.TestCase):
         self.assertTrue(
             is_kobo_library_url(
                 "https://www.kobo.com/tw/zh/library/books"
+            )
+        )
+
+    def test_readmoo_platform_id_resolves_to_canonical_eisbn(self):
+        purchases = [
+            Purchase(
+                user_id="reader",
+                platform="readmoo",
+                platform_book_id="17818597",
+                isbn="9786267747308",
+            ),
+        ]
+
+        self.assertEqual(
+            readmoo_canonical_isbn_by_platform_id(purchases),
+            {"17818597": "9786267747308"},
+        )
+
+    def test_short_platform_title_cannot_expand_to_different_book(self):
+        self.assertFalse(_metadata_matches_platform_title("鯨", "鯨滅"))
+        self.assertFalse(_metadata_matches_platform_title("大橋", "大橋驟雨"))
+        self.assertTrue(
+            _metadata_matches_platform_title(
+                "Python入門教室",
+                "Python入門教室：8堂基礎課程",
             )
         )
 
