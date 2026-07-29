@@ -366,6 +366,29 @@ class WishlistApiTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(book.title, "也許你該找人聊聊２（二版）")
 
+    def test_platform_snapshot_does_not_replace_cover_with_placeholder(self):
+        book = Book(
+            isbn="14286275",
+            title="也許你該找人聊聊２（二版）",
+            author="蘿蕊・葛利布",
+            cover_url="https://metadata.test/sequel.jpg",
+            category="心理勵志",
+        )
+
+        changed = apply_platform_snapshot(
+            book,
+            platform_book_id="14286275",
+            raw_title="也許你該找人聊聊2",
+            crawler_cover="/images/openbook.png",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(book.title, "也許你該找人聊聊2")
+        self.assertEqual(
+            book.cover_url,
+            "https://metadata.test/sequel.jpg",
+        )
+
     def test_metadata_decision_canonicalizes_exact_isbn(self):
         decision = decide_metadata_match(
             identifier="9786267747308",

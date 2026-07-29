@@ -402,6 +402,11 @@ def apply_platform_snapshot(
     )
     if title_changed:
         book.title = raw_title.strip()
-    if crawler_cover and (title_changed or not book.cover_url):
+    usable_crawler_cover = bool(
+        crawler_cover
+        and "openbook.png" not in crawler_cover.casefold()
+        and "placeholder" not in crawler_cover.casefold()
+    )
+    if usable_crawler_cover and (title_changed or not book.cover_url):
         book.cover_url = crawler_cover
     return before != (book.title, book.cover_url)
