@@ -132,38 +132,17 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
 
             await page.wait_for_timeout(2000)
 
-            # 3. 進入「書櫃」
-            print(f"[Readmoo Library Import] 正在自動點擊進入「書櫃」...")
+            # 3. 展開「書櫃」accordion。本按鈕只展開選單，不改 URL。
+            print("[Readmoo Library Import] 正在確認「書櫃」選單...")
             try:
-                bookcase_tab = await _first_visible(
+                bookcase_button = await _first_visible(
                     page,
                     (
-                        "a[href='#/library']",
-                        "a[href='/#/library']",
-                        "a[href$='#/library']",
-                        "nav a[href*='/library']",
-                        "[role='navigation'] a[href*='/library']",
-                        "nav a:has-text('書櫃')",
-                        "[role='navigation'] a:has-text('書櫃')",
-                        "button:has-text('書櫃')",
+                        "button.accordion-button:has-text('書櫃')",
+                        "button[aria-expanded]:has-text('書櫃')",
                     ),
                 )
-                if bookcase_tab is not None:
-                    target = await bookcase_tab.evaluate(
-                        """element => ({
-                            tag: element.tagName,
-                            href: element.getAttribute('href'),
-                            text: element.textContent.trim()
-                        })"""
-                    )
-                    print(
-                        "[Readmoo Library Import] 書櫃入口: "
-                        f"tag={target['tag']} href={target['href']} "
-                        f"text={target['text'][:30]}"
-                    )
-                    await bookcase_tab.click()
-                    print(f"[Readmoo Library Import] ✅ 已點擊書櫃，等待頁面切換...")
-                else:
+                if bookcase_button is None:
                     print(
                         "[Readmoo Library Import] 找不到可見的書櫃入口，"
                         f"目前 URL: {page.url}"
@@ -175,54 +154,42 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                         "message": "Readmoo 總覽頁找不到書櫃入口",
                         "new_books": 0,
                     }
+                expanded = (
+                    await bookcase_button.get_attribute("aria-expanded")
+                ) == "true"
+                if not expanded:
+                    await bookcase_button.click()
+                    await page.wait_for_timeout(500)
+                    print("[Readmoo Library Import] ✅ 已展開「書櫃」選單")
+                else:
+                    print("[Readmoo Library Import] 「書櫃」選單已展開")
             except Exception as e:
-                print(f"[Readmoo Library Import] 切換書櫃失敗: {e}")
+                print(f"[Readmoo Library Import] 展開書櫃選單失敗: {e}")
                 set_platform_session_status(user_id, "readmoo", "parser_error")
                 return {
                     "platform": "readmoo",
                     "status": "parser_error",
-                    "message": "Readmoo 無法切換至書櫃",
+                    "message": "Readmoo 無法展開書櫃選單",
                     "new_books": 0,
                 }
 
-            library_status = await wait_for_stable_route(
-                page,
-                is_readmoo_library_url,
-            )
-            if library_status != "ready":
-                print(
-                    "[Readmoo Library Import] 點擊後未穩定進入書櫃，"
-                    f"狀態: {library_status}，目前 URL: {page.url}"
-                )
-                status = "blocked" if library_status == "blocked" else "parser_error"
-                set_platform_session_status(user_id, "readmoo", status)
-                return {
-                    "platform": "readmoo",
-                    "status": status,
-                    "message": "Readmoo 尚未穩定進入書櫃，已停止同步",
-                    "new_books": 0,
-                }
-
-            # 4. 點擊「書籍」分類
-            print(f"[Readmoo Library Import] 正在自動點擊「書籍」分類...")
+            # 4. 點擊 accordion 內真正導航到 #/library 的「書籍」連結。
+            print("[Readmoo Library Import] 正在點擊「書籍」...")
             try:
                 books_btn = await _first_visible(
                     page,
                     (
+                        "a[href='#/library']:has-text('書籍')",
+                        "a[href='/#/library']:has-text('書籍')",
                         "[role='tab']:has-text('書籍')",
-                        "button:has-text('書籍')",
-                        "[role='button']:has-text('書籍')",
-                        "nav a:has-text('書籍')",
-                        "a:has-text('書籍')",
                     ),
                 )
                 if books_btn is not None:
                     await books_btn.click()
-                    print(f"[Readmoo Library Import] ✅ 已成功切換至「書籍」清單！")
-                    await page.wait_for_timeout(2000)
+                    print("[Readmoo Library Import] ✅ 已點擊「書籍」，等待 #/library")
                 else:
                     print(
-                        "[Readmoo Library Import] 已進入書櫃但找不到"
+                        "[Readmoo Library Import] 書櫃選單內找不到"
                         f"可見的「書籍」分類，目前 URL: {page.url}"
                     )
                     set_platform_session_status(user_id, "readmoo", "parser_error")
@@ -241,6 +208,25 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                     "message": "Readmoo 無法切換至「書籍」分類",
                     "new_books": 0,
                 }
+
+            library_status = await wait_for_stable_route(
+                page,
+                is_readmoo_library_url,
+            )
+            if library_status != "ready":
+                print(
+                    "[Readmoo Library Import] 點擊「書籍」後未穩定進入"
+                    f" #/library，狀態: {library_status}，目前 URL: {page.url}"
+                )
+                status = "blocked" if library_status == "blocked" else "parser_error"
+                set_platform_session_status(user_id, "readmoo", status)
+                return {
+                    "platform": "readmoo",
+                    "status": status,
+                    "message": "Readmoo 尚未穩定進入書籍頁面，已停止同步",
+                    "new_books": 0,
+                }
+            print("[Readmoo Library Import] ✅ 已穩定進入 #/library 書籍頁面")
 
             # 5. 展開全部書籍
             print(f"[Readmoo Library Import] 正在展開並載入所有書籍...")
