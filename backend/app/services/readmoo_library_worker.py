@@ -5,6 +5,11 @@ from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
 from app.services.library_metadata import refresh_incomplete_book_metadata
+from app.services.library_navigation import (
+    is_readmoo_dashboard_url,
+    is_readmoo_library_url,
+    wait_for_stable_route,
+)
 from app.services.wishlist_reconciliation import deduplicate_remote_books
 from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
@@ -60,7 +65,26 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             
             # 1. 前往閱讀器首頁 / 總覽
             await page.goto("https://read.readmoo.com/#/dashboard", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
+            dashboard_status = await wait_for_stable_route(
+                page,
+                is_readmoo_dashboard_url,
+            )
+            if dashboard_status == "blocked":
+                set_platform_session_status(user_id, "readmoo", "blocked")
+                return {
+                    "platform": "readmoo",
+                    "status": "blocked",
+                    "message": "Readmoo 要求完成人機驗證，已停止同步",
+                    "new_books": 0,
+                }
+            if dashboard_status != "ready":
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "message": "Readmoo 總覽頁仍在重載，已停止同步",
+                    "new_books": 0,
+                }
 
             # 2. 自動偵測登入
             current_url = page.url.lower()
@@ -102,12 +126,37 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                 if await bookcase_tab.count() > 0 and await bookcase_tab.is_visible():
                     await bookcase_tab.click()
                     print(f"[Readmoo Library Import] ✅ 已點擊書櫃，等待頁面切換...")
-                    await page.wait_for_timeout(3000)
                 else:
-                    await page.evaluate("window.location.hash = '/library';")
-                    await page.wait_for_timeout(3000)
+                    set_platform_session_status(user_id, "readmoo", "parser_error")
+                    return {
+                        "platform": "readmoo",
+                        "status": "parser_error",
+                        "message": "Readmoo 總覽頁找不到書櫃入口",
+                        "new_books": 0,
+                    }
             except Exception as e:
-                print(f"[Readmoo Library Import] 切換書櫃發生小插曲: {e}")
+                print(f"[Readmoo Library Import] 切換書櫃失敗: {e}")
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "message": "Readmoo 無法切換至書櫃",
+                    "new_books": 0,
+                }
+
+            library_status = await wait_for_stable_route(
+                page,
+                is_readmoo_library_url,
+            )
+            if library_status != "ready":
+                status = "blocked" if library_status == "blocked" else "parser_error"
+                set_platform_session_status(user_id, "readmoo", status)
+                return {
+                    "platform": "readmoo",
+                    "status": status,
+                    "message": "Readmoo 尚未穩定進入書櫃，已停止同步",
+                    "new_books": 0,
+                }
 
             # 4. 點擊「書籍」分類
             print(f"[Readmoo Library Import] 正在自動點擊「書籍」分類...")
@@ -117,8 +166,23 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
                     await books_btn.click()
                     print(f"[Readmoo Library Import] ✅ 已成功切換至「書籍」清單！")
                     await page.wait_for_timeout(2000)
+                else:
+                    set_platform_session_status(user_id, "readmoo", "parser_error")
+                    return {
+                        "platform": "readmoo",
+                        "status": "parser_error",
+                        "message": "Readmoo 書櫃找不到「書籍」分類",
+                        "new_books": 0,
+                    }
             except Exception as e:
-                print(f"[Readmoo Library Import] 切換書籍分類發生小插曲: {e}")
+                print(f"[Readmoo Library Import] 切換書籍分類失敗: {e}")
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "message": "Readmoo 無法切換至「書籍」分類",
+                    "new_books": 0,
+                }
 
             # 5. 展開全部書籍
             print(f"[Readmoo Library Import] 正在展開並載入所有書籍...")
@@ -141,6 +205,14 @@ async def import_readmoo_library_to_db(user_id: str, limit: int | None = None):
             book_items = page.locator(".library-item")
             count = await book_items.count()
             print(f"[Readmoo Library Import] 展開完成，實際找到書本區塊數量: {count}")
+            if count == 0:
+                set_platform_session_status(user_id, "readmoo", "parser_error")
+                return {
+                    "platform": "readmoo",
+                    "status": "parser_error",
+                    "message": "Readmoo 書籍清單尚未完成載入",
+                    "new_books": 0,
+                }
 
             for i in range(count):
                 item = book_items.nth(i)

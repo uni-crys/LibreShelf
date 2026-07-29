@@ -6,6 +6,11 @@ from sqlmodel import Session, select
 from app.database import engine
 from app.models import Book, Purchase
 from app.services.library_metadata import refresh_incomplete_book_metadata
+from app.services.library_navigation import (
+    is_kobo_home_url,
+    is_kobo_library_url,
+    wait_for_stable_route,
+)
 from app.services.wishlist_reconciliation import deduplicate_remote_books
 from app.services.metadata_pipeline import fetch_and_clean_metadata
 from app.services.platform_auth import (
@@ -72,8 +77,30 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                     else ""
                 )
             )
-            await page.goto("https://www.kobo.com/tw/zh/library/books", wait_until="commit", timeout=40000)
-            await page.wait_for_timeout(2000)
+            # Establish the authenticated storefront session first.  Jumping
+            # directly into /library/books is prone to Kobo bot challenges.
+            await page.goto(
+                "https://www.kobo.com/tw/zh",
+                wait_until="domcontentloaded",
+                timeout=40000,
+            )
+            home_status = await wait_for_stable_route(page, is_kobo_home_url)
+            if home_status == "blocked":
+                set_platform_session_status(user_id, "kobo", "blocked")
+                return {
+                    "platform": "kobo",
+                    "status": "blocked",
+                    "message": "Kobo 要求完成人機驗證，請使用 noVNC 手動勾選",
+                    "new_books": 0,
+                }
+            if home_status != "ready":
+                set_platform_session_status(user_id, "kobo", "parser_error")
+                return {
+                    "platform": "kobo",
+                    "status": "parser_error",
+                    "message": "Kobo 首頁尚未穩定載入，已停止書櫃同步",
+                    "new_books": 0,
+                }
 
             auth_cookies = get_platform_auth_cookies(
                 await context.cookies(),
@@ -101,6 +128,32 @@ async def import_kobo_library_to_db(user_id: str, limit: int | None = None):
                 }
 
             set_platform_session_status(user_id, "kobo", "active")
+
+            await page.goto(
+                "https://www.kobo.com/tw/zh/library/books",
+                wait_until="domcontentloaded",
+                timeout=40000,
+            )
+            library_status = await wait_for_stable_route(
+                page,
+                is_kobo_library_url,
+            )
+            if library_status == "blocked":
+                set_platform_session_status(user_id, "kobo", "blocked")
+                return {
+                    "platform": "kobo",
+                    "status": "blocked",
+                    "message": "Kobo 書櫃觸發人機驗證，請使用 noVNC 手動勾選",
+                    "new_books": 0,
+                }
+            if library_status != "ready":
+                set_platform_session_status(user_id, "kobo", "parser_error")
+                return {
+                    "platform": "kobo",
+                    "status": "parser_error",
+                    "message": "Kobo 未能穩定進入書櫃，已停止同步",
+                    "new_books": 0,
+                }
 
             page_num = 1
             while True:

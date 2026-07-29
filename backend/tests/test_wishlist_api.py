@@ -12,6 +12,12 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.api import auth, readmoo_replication
 from app.services import platform_auth
 from app.services.kobo_library_worker import _canonical_isbn_by_platform_id
+from app.services.library_navigation import (
+    is_kobo_home_url,
+    is_kobo_library_url,
+    is_readmoo_dashboard_url,
+    is_readmoo_library_url,
+)
 from app.services.wishlist_reconciliation import (
     deduplicate_remote_books,
     remove_stale_synced_wishlist_items,
@@ -192,6 +198,25 @@ class WishlistApiTests(unittest.TestCase):
         self.assertEqual(
             _canonical_isbn_by_platform_id(purchases),
             {"kobo-product-uuid": "9786263901438"},
+        )
+
+    def test_library_navigation_requires_expected_platform_route(self):
+        self.assertTrue(
+            is_readmoo_dashboard_url(
+                "https://read.readmoo.com/#/dashboard"
+            )
+        )
+        self.assertTrue(
+            is_readmoo_library_url("https://read.readmoo.com/#/library")
+        )
+        self.assertFalse(
+            is_readmoo_library_url("https://read.readmoo.com/#/dashboard")
+        )
+        self.assertTrue(is_kobo_home_url("https://www.kobo.com/tw/zh/"))
+        self.assertTrue(
+            is_kobo_library_url(
+                "https://www.kobo.com/tw/zh/library/books"
+            )
         )
 
     def test_local_readmoo_snapshot_upserts_without_cookie_data(self):
